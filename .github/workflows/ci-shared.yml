@@ -1,0 +1,83 @@
+# Reusable CI workflow — typecheck + lint + test.
+# Called by every repo's .github/workflows/ci.yml as `uses:`.
+# Build is intentionally OMITTED — Coolify owns build+deploy on push to main
+# (webhook-driven). GitHub Actions never builds prod artifacts.
+name: ci-shared
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        type: string
+        default: "22"
+      pnpm-version:
+        type: string
+        default: "9"
+      package-manager:
+        description: "pnpm | npm | yarn"
+        type: string
+        default: "pnpm"
+      skip-tests:
+        description: "Set to true for repos without a test suite"
+        type: boolean
+        default: false
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        if: inputs.package-manager == 'pnpm'
+        with:
+          version: ${{ inputs.pnpm-version }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+
+      - name: Install deps
+        shell: bash
+        run: |
+          PM="${{ inputs.package-manager }}"
+          if [ "$PM" = "pnpm" ]; then
+            pnpm install --frozen-lockfile
+          elif [ "$PM" = "yarn" ]; then
+            yarn install --frozen-lockfile
+          else
+            npm install --prefer-offline --no-audit --no-fund
+          fi
+
+      - name: Type check
+        shell: bash
+        run: |
+          PM="${{ inputs.package-manager }}"
+          if grep -q '"typecheck"' package.json; then
+            $PM run typecheck
+          else
+            echo "no typecheck script — falling back to tsc --noEmit"
+            npx --no-install tsc --noEmit
+          fi
+
+      - name: Lint
+        shell: bash
+        run: |
+          PM="${{ inputs.package-manager }}"
+          if grep -q '"lint"' package.json; then
+            $PM run lint
+          else
+            echo "no lint script defined — skipping"
+          fi
+
+      - name: Test
+        if: ${{ !inputs.skip-tests }}
+        shell: bash
+        run: |
+          PM="${{ inputs.package-manager }}"
+          if grep -q '"test"' package.json; then
+            $PM run test --if-present
+          else
+            echo "no test script — skipping"
+          fi

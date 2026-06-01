@@ -1,0 +1,61 @@
+# Reusable security workflow — gitleaks (secrets) + npm audit (deps) + CodeQL (SAST).
+# Called by each repo's .github/workflows/security.yml as `uses:`.
+name: security-shared
+on:
+  workflow_call:
+    inputs:
+      language:
+        type: string
+        default: "javascript-typescript"
+      skip-codeql:
+        type: boolean
+        default: false
+
+jobs:
+  gitleaks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+  npm-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: "9" }
+      - uses: actions/setup-node@v4
+        with: { node-version: "22", cache: "pnpm" }
+      - name: Audit (advisory only — never fails the workflow)
+        shell: bash
+        run: |
+          # Advisory: print but don't fail. Real fix path is Dependabot PRs.
+          pnpm audit --prod --json > audit.json 2>&1 || true
+          HIGH=$(jq '[.advisories[]? | select(.severity=="high")] | length' audit.json 2>/dev/null || echo 0)
+          CRIT=$(jq '[.advisories[]? | select(.severity=="critical")] | length' audit.json 2>/dev/null || echo 0)
+          echo "Audit: $CRIT critical, $HIGH high"
+          if [ "$CRIT" -gt "0" ]; then
+            echo "::warning::$CRIT critical npm advisories — open a Dependabot PR or update manually"
+          fi
+
+  codeql:
+    if: ${{ !inputs.skip-codeql }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ inputs.language }}
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ inputs.language }}"

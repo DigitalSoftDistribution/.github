@@ -1,0 +1,32 @@
+# Reusable Merge Mate sync workflow — auto-rebases open PRs against main.
+# Uses GITHUB_TOKEN fallback because the GitKraken Merge Mate GitHub App
+# is not installed on the DigitalSoftDistribution org. If we install it
+# later, this workflow keeps working (token is still accepted as a fallback).
+name: merge-mate-shared
+on:
+  workflow_call:
+    secrets:
+      MERGE_MATE_API_KEY:
+        required: true
+
+concurrency:
+  group: merge-mate-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write
+    steps:
+      - uses: gitkraken/merge-mate-action/sync@v0.4.3
+        with:
+          mode: rebase
+          apply-policy: auto
+          confidence-threshold: 80
+          concurrency: 4
+          ai-api-key: ${{ secrets.MERGE_MATE_API_KEY }}
+          github-token: ${{ github.token }}
