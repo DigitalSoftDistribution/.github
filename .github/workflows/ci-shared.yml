@@ -25,6 +25,10 @@ jobs:
   ci:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      # Raise V8 heap so `tsc --noEmit` / eslint don't SIGABRT (exit 134, OOM)
+      # on large codebases. ubuntu-latest has ~16GB RAM; 6GB leaves headroom.
+      NODE_OPTIONS: --max-old-space-size=6144
     steps:
       - uses: actions/checkout@v4
 
