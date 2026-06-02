@@ -81,7 +81,11 @@ jobs:
         run: |
           PM="${{ inputs.package-manager }}"
           if grep -q '"test"' package.json; then
-            $PM run test --if-present
+            # NOTE: no `--if-present` here — the grep guard above already
+            # handles a missing script. With pnpm, a trailing `--if-present`
+            # is forwarded into the test runner's argv (e.g. `vitest run
+            # --if-present`), which errors with "Unknown option".
+            $PM run test
           else
             echo "no test script — skipping"
           fi
