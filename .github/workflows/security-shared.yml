@@ -58,8 +58,11 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+      # No version pin: pnpm/action-setup reads each repo's package.json
+      # "packageManager" field. Pinning a major (e.g. "9") conflicts with a
+      # precise packageManager value (e.g. pnpm@9.15.4) and fails with
+      # ERR_PNPM_BAD_PM_VERSION before the audit can run.
       - uses: pnpm/action-setup@v4
-        with: { version: "9" }
       # No `cache: pnpm` here: the audit doesn't need a warm store and the cache
       # Post-step has been flaky (fails the job after an otherwise-green audit).
       - uses: actions/setup-node@v4
