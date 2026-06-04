@@ -24,7 +24,12 @@ on:
 jobs:
   ci:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Typecheck + lint + test run serially in this single job with no turbo
+    # remote cache, so large monorepos (e.g. tracklayer) rebuild upstream
+    # packages cold for each phase. 10m was too tight — the Test step was being
+    # killed mid-run by the wall clock. 20m gives headroom without masking real
+    # hangs. (Longer-term: enable turbo remote cache to cut cold rebuild time.)
+    timeout-minutes: 20
     env:
       # Raise V8 heap so `tsc --noEmit` / eslint don't SIGABRT (exit 134, OOM)
       # on large codebases. ubuntu-latest has ~16GB RAM; 6GB leaves headroom.
