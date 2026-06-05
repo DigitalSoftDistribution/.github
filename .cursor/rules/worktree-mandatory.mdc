@@ -1,0 +1,53 @@
+---
+description: Multi-agent isolation — ALWAYS use git worktree for EVERY task that edits files so concurrent agents (Cursor Composer, Claude Code, Windsurf, Copilot) don't override each other's work. NON-NEGOTIABLE.
+alwaysApply: true
+---
+
+# Worktree-Mandatory — Multi-Agent Safety
+
+## The rule
+
+**NEVER work on a feature branch in the main repo workspace.** Every task that edits files — feature, fix, refactor, typo, one-line change — goes into its own `git worktree`. The main repo path (e.g. `~/softbla/<repo>`) is reserved for the `main` branch only.
+
+When multiple agents share a repo on the same machine, working in the same directory causes:
+- File-edit collisions — one agent's edits silently overwrite the other's
+- Branch-state confusion — you think you're on `feat/X` but the partner agent just checked out `fix/Y` under you
+- Wasted context, silent regressions, broken merges
+
+## Required workflow — EVERY file-editing task, no exceptions for "small"
+
+```bash
+# 1. Check if another agent already has a worktree for this repo
+ls ~/softbla/<repo>-* 2>/dev/null
+
+# 2. Create your own isolated worktree (one per task, fresh branch)
+git worktree add ~/softbla/<repo>-<feature-slug> -b feat/<feature-slug>
+
+# 3. Work EXCLUSIVELY in that directory — `cd` once and stay
+cd ~/softbla/<repo>-<feature-slug>
+
+# 4. After the PR merges, clean up
+git worktree remove ~/softbla/<repo>-<feature-slug>
+git branch -d feat/<feature-slug>
+```
+
+If the task will modify a single byte in the repo, you create a worktree. No size/time exception.
+
+## Skip worktree ONLY when:
+
+- **Read-only** — searching, reading, analyzing, with zero file edits. If you find yourself about to write a single character to a tracked file, STOP and create a worktree first.
+- **Cloud-only MCP tools** — Firecrawl, Brain, Semrush, Kimi, Linear, Cloudflare, etc. don't touch the local filesystem, so they're safe in any directory.
+
+## Hard prohibitions
+
+- Do NOT `git checkout <feature-branch>` in the main repo workspace
+- Do NOT edit ANY tracked file in the main repo workspace unless you're on `main` AND only fixing the merge commit you just landed
+- Do NOT skip the worktree because "this change is small" — the next agent doesn't know it's small, and your unfinished state WILL collide with theirs
+- Do NOT use `git stash` as a substitute for a worktree — stashes are invisible to peer agents and easy to lose
+- Do NOT batch multiple feature branches into one worktree — one task = one worktree
+
+## Why this rule exists
+
+Concrete past failure: parallel agents working on the same repo's `main` directory have repeatedly overwritten each other's in-progress changes. Worktrees are the only mechanism that gives each agent a private filesystem view while sharing the underlying git history.
+
+There is no exception worth the cost. When you're tempted to skip it, run `git worktree add` instead — it's 5 seconds.
