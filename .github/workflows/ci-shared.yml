@@ -20,10 +20,14 @@ on:
         description: "Set to true for repos without a test suite"
         type: boolean
         default: false
+      runner:
+        description: "runs-on label — self-hosted coolify-ci pool by default (0 cloud minutes). Override to ubuntu-latest only if a job needs the hosted image."
+        type: string
+        default: "coolify-ci"
 
 jobs:
   ci:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     # Typecheck + lint + test run serially in this single job with no turbo
     # remote cache, so large monorepos (e.g. tracklayer) rebuild upstream
     # packages cold for each phase. 10m was too tight — the Test step was being
