@@ -18,7 +18,7 @@ on:
 
 jobs:
   gitleaks:
-    runs-on: ubuntu-latest
+    runs-on: coolify-ci
     timeout-minutes: 5
     # Surface the secret into a job-level env var so step `if:` conditions can read
     # it (GitHub Actions forbids `secrets.*` directly inside `if:`).
@@ -54,7 +54,7 @@ jobs:
           fi
 
   npm-audit:
-    runs-on: ubuntu-latest
+    runs-on: coolify-ci
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -81,7 +81,7 @@ jobs:
 
   codeql:
     if: ${{ !inputs.skip-codeql }}
-    runs-on: ubuntu-latest
+    runs-on: coolify-ci
     timeout-minutes: 15
     permissions:
       security-events: write
