@@ -29,11 +29,13 @@ jobs:
   ci:
     runs-on: ${{ inputs.runner }}
     # Typecheck + lint + test run serially in this single job with no turbo
-    # remote cache, so large monorepos (e.g. tracklayer) rebuild upstream
-    # packages cold for each phase. 10m was too tight — the Test step was being
-    # killed mid-run by the wall clock. 20m gives headroom without masking real
-    # hangs. (Longer-term: enable turbo remote cache to cut cold rebuild time.)
-    timeout-minutes: 20
+    # remote cache, so large monorepos (e.g. keyflow, tracklayer) rebuild
+    # upstream packages cold for each phase. History: 10m -> 20m -> 40m. 20m
+    # was still killing keyflow mid-Test on the 3cpu coolify-ci runners (real
+    # incident 2026-07-23: all branches cancelled at exactly 20m0s). 40m gives
+    # headroom on the largest monorepos. (Longer-term: enable turbo remote
+    # cache to cut the 3x cold-rebuild time and pull this back down.)
+    timeout-minutes: 40
     env:
       # Raise V8 heap so `tsc --noEmit` / eslint don't SIGABRT (exit 134, OOM)
       # on large codebases. ubuntu-latest has ~16GB RAM; 6GB leaves headroom.
