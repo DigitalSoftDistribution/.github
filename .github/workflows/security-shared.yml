@@ -58,11 +58,26 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+      # 2026-07-28: not every consuming repo uses pnpm (e.g. liveagent-ai is
+      # plain npm/package-lock.json). pnpm/action-setup hard-fails on a repo
+      # with no packageManager field and no pnpm-lock.yaml -- that failure
+      # happens before the audit script's own advisory `|| true` can help, so
+      # the package-manager choice has to be made up front.
+      - name: Detect package manager
+        id: pkgmgr
+        shell: bash
+        run: |
+          if [ -f pnpm-lock.yaml ]; then
+            echo "manager=pnpm" >> "$GITHUB_OUTPUT"
+          else
+            echo "manager=npm" >> "$GITHUB_OUTPUT"
+          fi
       # No version pin: pnpm/action-setup reads each repo's package.json
       # "packageManager" field. Pinning a major (e.g. "9") conflicts with a
       # precise packageManager value (e.g. pnpm@9.15.4) and fails with
       # ERR_PNPM_BAD_PM_VERSION before the audit can run.
       - uses: pnpm/action-setup@v4
+        if: steps.pkgmgr.outputs.manager == 'pnpm'
       # No `cache: pnpm` here: the audit doesn't need a warm store and the cache
       # Post-step has been flaky (fails the job after an otherwise-green audit).
       - uses: actions/setup-node@v4
@@ -71,10 +86,16 @@ jobs:
         shell: bash
         run: |
           # Advisory: print but don't fail. Real fix path is Dependabot PRs.
-          pnpm audit --prod --json > audit.json 2>&1 || true
-          HIGH=$(jq '[.advisories[]? | select(.severity=="high")] | length' audit.json 2>/dev/null || echo 0)
-          CRIT=$(jq '[.advisories[]? | select(.severity=="critical")] | length' audit.json 2>/dev/null || echo 0)
-          echo "Audit: $CRIT critical, $HIGH high"
+          if [ "${{ steps.pkgmgr.outputs.manager }}" = "pnpm" ]; then
+            pnpm audit --prod --json > audit.json 2>&1 || true
+            HIGH=$(jq '[.advisories[]? | select(.severity=="high")] | length' audit.json 2>/dev/null || echo 0)
+            CRIT=$(jq '[.advisories[]? | select(.severity=="critical")] | length' audit.json 2>/dev/null || echo 0)
+          else
+            npm audit --omit=dev --json > audit.json 2>&1 || true
+            HIGH=$(jq '.metadata.vulnerabilities.high // 0' audit.json 2>/dev/null || echo 0)
+            CRIT=$(jq '.metadata.vulnerabilities.critical // 0' audit.json 2>/dev/null || echo 0)
+          fi
+          echo "Audit (${{ steps.pkgmgr.outputs.manager }}): $CRIT critical, $HIGH high"
           if [ "$CRIT" -gt "0" ]; then
             echo "::warning::$CRIT critical npm advisories — open a Dependabot PR or update manually"
           fi
