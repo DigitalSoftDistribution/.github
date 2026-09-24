@@ -144,6 +144,9 @@ jobs:
     # separate "Enforce" step fails the job only when the caller opted in.
     runs-on: coolify-ci
     timeout-minutes: 10
+    # Least privilege: the scan reads the checkout only (artifact upload uses the runtime token).
+    permissions:
+      contents: read
     env:
       TRIVY_VERSION: "0.74.0"
       TRIVY_SHA256_X64: "2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a"
@@ -314,6 +317,8 @@ jobs:
     if: ${{ inputs.preview_url != '' }}
     runs-on: coolify-ci
     timeout-minutes: 15
+    permissions:
+      contents: read
     steps:
       - name: ZAP baseline scan
         id: zap
