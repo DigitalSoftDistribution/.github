@@ -1,10 +1,14 @@
-# Reusable security workflow — gitleaks (secrets) + npm audit (deps) + CodeQL (SAST).
+# Reusable security workflow — gitleaks (secrets) + npm audit (deps) + CodeQL (SAST) + trivy
+# (vuln/secret/misconfig) + optional ZAP baseline (DAST against a PR preview).
 # Called by each repo's .github/workflows/security.yml as `uses:`.
 #
 # Design goals:
 #  - Never block merges on infra/licensing gaps we don't control. Secret + SAST
 #    findings should surface as warnings/annotations, not hard CI failures, until
 #    the org enables the corresponding paid/repo-level features.
+#  - trivy is the one HARD gate added here (HIGH/CRITICAL fails the job) — it scans
+#    the repo's own lockfiles/Dockerfiles, not third-party infra, so a red trivy is
+#    always actionable by the repo itself.
 name: security-shared
 on:
   workflow_call:
@@ -15,6 +19,12 @@ on:
       skip-codeql:
         type: boolean
         default: false
+      preview_url:
+        type: string
+        default: ""
+        description: >
+          PR preview URL for the ZAP baseline scan (e.g. https://pr-123-lizensa.previews.softblaze.net).
+          Leave empty to skip the zap-baseline job entirely — it does not run without a target.
 
 jobs:
   gitleaks:
@@ -99,6 +109,44 @@ jobs:
           if [ "$CRIT" -gt "0" ]; then
             echo "::warning::$CRIT critical npm advisories — open a Dependabot PR or update manually"
           fi
+
+  trivy:
+    # dev-environment-research-2026-09-24.md item #7. HIGH/CRITICAL fails the job — unlike the
+    # other advisory jobs here, this one scans only the calling repo's OWN lockfiles/Dockerfiles,
+    # so a red result is always something the repo itself can fix, not an org/licensing gap.
+    runs-on: coolify-ci
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      # The beast-gha-runner image (tools/install-dev-test-clis.sh) pre-pulls trivy's vuln DB at
+      # build time into TRIVY_CACHE_DIR with TRIVY_SKIP_DB_UPDATE=true already set — this job never
+      # hits the network for the DB itself, only for `trivy fs`'s own repo scan.
+      - name: trivy fs (vuln, secret, misconfig)
+        shell: bash
+        run: |
+          trivy fs \
+            --scanners vuln,secret,misconfig \
+            --severity HIGH,CRITICAL \
+            --exit-code 1 \
+            --skip-db-update \
+            . 2>&1 | tee trivy.log
+          echo "trivy: scan complete — see the step log above for any HIGH/CRITICAL findings"
+
+  zap-baseline:
+    # Optional, non-blocking at first (dev-environment-research item #7 / install-order day 9):
+    # only runs when the caller passes a preview_url (e.g. once a PR is Ready for review and its
+    # Coolify preview is live). `continue-on-error` until findings have been triaged org-wide.
+    if: ${{ inputs.preview_url != '' }}
+    runs-on: coolify-ci
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - name: ZAP baseline scan
+        uses: zaproxy/action-baseline@v0.14.0
+        with:
+          target: ${{ inputs.preview_url }}
+          cmd_options: "-z '-silent'"
+          fail_action: false
 
   codeql:
     if: ${{ !inputs.skip-codeql }}
