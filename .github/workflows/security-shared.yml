@@ -85,18 +85,32 @@ jobs:
       - name: Detect package manager
         id: pkgmgr
         shell: bash
+        # 2026-09-24: a pnpm-lock.yaml alone is not proof the repo uses pnpm. dsh-plugins
+        # carries both lockfiles, installs with `npm ci`, and has no packageManager field,
+        # so pnpm/action-setup died with "No pnpm version is specified". Order:
+        #   packageManager: pnpm@x -> pnpm (action reads the exact version)
+        #   package-lock.json      -> npm
+        #   pnpm-lock.yaml only    -> pnpm, explicit major (no packageManager to read)
         run: |
-          if [ -f pnpm-lock.yaml ]; then
+          PM=$(jq -r '.packageManager // ""' package.json 2>/dev/null || true)
+          if [[ "$PM" == pnpm@* ]]; then
             echo "manager=pnpm" >> "$GITHUB_OUTPUT"
+            echo "pnpm_version=" >> "$GITHUB_OUTPUT"
+          elif [ -f package-lock.json ]; then
+            echo "manager=npm" >> "$GITHUB_OUTPUT"
+          elif [ -f pnpm-lock.yaml ]; then
+            echo "manager=pnpm" >> "$GITHUB_OUTPUT"
+            echo "pnpm_version=10" >> "$GITHUB_OUTPUT"
           else
             echo "manager=npm" >> "$GITHUB_OUTPUT"
           fi
-      # No version pin: pnpm/action-setup reads each repo's package.json
-      # "packageManager" field. Pinning a major (e.g. "9") conflicts with a
-      # precise packageManager value (e.g. pnpm@9.15.4) and fails with
-      # ERR_PNPM_BAD_PM_VERSION before the audit can run.
+      # `version` is empty whenever package.json has a packageManager field, so the
+      # action reads that exact value. Pinning a major there conflicts with a precise
+      # packageManager (e.g. pnpm@9.15.4) and fails with ERR_PNPM_BAD_PM_VERSION.
       - uses: pnpm/action-setup@v4
         if: steps.pkgmgr.outputs.manager == 'pnpm'
+        with:
+          version: ${{ steps.pkgmgr.outputs.pnpm_version }}
       # No `cache: pnpm` here: the audit doesn't need a warm store and the cache
       # Post-step has been flaky (fails the job after an otherwise-green audit).
       - uses: actions/setup-node@v4
