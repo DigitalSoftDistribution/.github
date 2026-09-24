@@ -6,9 +6,11 @@
 #  - Never block merges on infra/licensing gaps we don't control. Secret + SAST
 #    findings should surface as warnings/annotations, not hard CI failures, until
 #    the org enables the corresponding paid/repo-level features.
-#  - trivy is the one HARD gate added here (HIGH/CRITICAL fails the job) — it scans
-#    the repo's own lockfiles/Dockerfiles, not third-party infra, so a red trivy is
-#    always actionable by the repo itself.
+#  - trivy (HIGH/CRITICAL) is ADVISORY on first rollout: counts go to the job summary,
+#    the JSON+SARIF report to the `trivy-report` artifact, and the check stays green.
+#    A repo opts into failing with `trivy_blocking: true`. It scans only the repo's own
+#    lockfiles/Dockerfiles/IaC, so a finding is always actionable by that repo.
+#  - ZAP baseline is opt-in (pass `preview_url`) and never blocks.
 name: security-shared
 on:
   workflow_call:
@@ -19,6 +21,13 @@ on:
       skip-codeql:
         type: boolean
         default: false
+      trivy_blocking:
+        type: boolean
+        default: false
+        description: >
+          Fail the security check when trivy finds HIGH/CRITICAL vulnerabilities, secrets or
+          misconfigurations (or cannot complete the scan). Default false = advisory: findings are
+          reported in the job summary and the trivy-report artifact but never fail the check.
       preview_url:
         type: string
         default: ""
@@ -111,42 +120,214 @@ jobs:
           fi
 
   trivy:
-    # dev-environment-research-2026-09-24.md item #7. HIGH/CRITICAL fails the job — unlike the
-    # other advisory jobs here, this one scans only the calling repo's OWN lockfiles/Dockerfiles,
-    # so a red result is always something the repo itself can fix, not an org/licensing gap.
+    # dev-environment-research-2026-09-24.md item #7. ADVISORY on first rollout: HIGH/CRITICAL
+    # findings are reported (job summary + annotation + `trivy-report` artifact) but do NOT fail
+    # the `security` check unless the caller passes `trivy_blocking: true`. A scan/infra error
+    # (trivy download, vuln-DB fetch) is also advisory unless blocking is on.
+    #
+    # Deliberately NOT `continue-on-error: true`: at job level GitHub still shows the job as
+    # FAILED on the check (that stalled kwn #1865). The scan step instead always exits 0 and a
+    # separate "Enforce" step fails the job only when the caller opted in.
     runs-on: coolify-ci
     timeout-minutes: 10
+    env:
+      TRIVY_VERSION: "0.74.0"
+      TRIVY_SHA256_X64: "2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a"
+      TRIVY_SHA256_ARM64: "b94ce1976bbf3c15b514b605ee88be7c6d94a29be2302847ff01cb794d47aad5"
+      TRIVY_BLOCKING: ${{ inputs.trivy_blocking }}
     steps:
       - uses: actions/checkout@v4
-      # The beast-gha-runner image (tools/install-dev-test-clis.sh) pre-pulls trivy's vuln DB at
-      # build time into TRIVY_CACHE_DIR with TRIVY_SKIP_DB_UPDATE=true already set — this job never
-      # hits the network for the DB itself, only for `trivy fs`'s own repo scan.
-      - name: trivy fs (vuln, secret, misconfig)
+        with:
+          persist-credentials: false
+      - name: trivy fs (vuln, secret, misconfig — HIGH/CRITICAL)
+        id: scan
         shell: bash
         run: |
-          trivy fs \
-            --scanners vuln,secret,misconfig \
-            --severity HIGH,CRITICAL \
-            --exit-code 1 \
-            --skip-db-update \
-            . 2>&1 | tee trivy.log
-          echo "trivy: scan complete — see the step log above for any HIGH/CRITICAL findings"
+          # No `set -e`: every failure is captured into STATUS so advisory mode can never go red.
+          set -uo pipefail
+          REPORT_DIR="$RUNNER_TEMP/trivy-report"
+          JSON="$REPORT_DIR/trivy.json"
+          mkdir -p "$REPORT_DIR"
+          STATUS=ok
+          ERR=""
+
+          # Reuse a runner-provided trivy when present; otherwise install the pinned release
+          # into RUNNER_TEMP with its checksum verified.
+          TRIVY="$(command -v trivy || true)"
+          if [ -z "$TRIVY" ]; then
+            case "$(uname -m)" in
+              x86_64)        ASSET=Linux-64bit; SHA="$TRIVY_SHA256_X64" ;;
+              aarch64|arm64) ASSET=Linux-ARM64; SHA="$TRIVY_SHA256_ARM64" ;;
+              *)             ASSET=""; SHA="" ;;
+            esac
+            TARBALL="trivy_${TRIVY_VERSION}_${ASSET}.tar.gz"
+            if [ -n "$ASSET" ] \
+              && curl -fsSL --retry 3 --retry-delay 2 -o "$RUNNER_TEMP/$TARBALL" \
+                   "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${TARBALL}" \
+              && echo "${SHA}  $RUNNER_TEMP/$TARBALL" | sha256sum -c - >/dev/null \
+              && tar -xzf "$RUNNER_TEMP/$TARBALL" -C "$RUNNER_TEMP" trivy; then
+              TRIVY="$RUNNER_TEMP/trivy"
+            else
+              STATUS=error
+              ERR="could not install trivy ${TRIVY_VERSION} for $(uname -m)"
+            fi
+          fi
+
+          if [ "$STATUS" = ok ]; then
+            echo "Using $("$TRIVY" --version | head -1) at $TRIVY"
+            # --exit-code 0: findings never fail this step; enforcement is the separate step below.
+            if ! "$TRIVY" fs \
+                --scanners vuln,secret,misconfig \
+                --severity HIGH,CRITICAL \
+                --exit-code 0 \
+                --timeout 8m \
+                --format json --output "$JSON" \
+                . 2> >(tee "$REPORT_DIR/trivy.log" >&2); then
+              STATUS=error
+              ERR="trivy fs exited non-zero (see trivy.log in the trivy-report artifact)"
+            elif ! jq -e 'has("SchemaVersion")' "$JSON" >/dev/null 2>&1; then
+              STATUS=error
+              ERR="trivy produced no parsable JSON report"
+            fi
+          fi
+          if [ "$STATUS" = ok ]; then
+            "$TRIVY" convert --format sarif --output "$REPORT_DIR/trivy.sarif" "$JSON" \
+              || echo "::warning::trivy: SARIF conversion failed — JSON report is still in the artifact"
+          fi
+
+          # Counts per scanner x severity. The Status filter applies to misconfig only (FAIL vs PASS):
+          # a vulnerability's .Status is its fix state ("fixed", "affected"), not pass/fail.
+          count() {
+            jq --arg k "$1" --arg s "$2" \
+              '[.Results[]? | .[$k][]? | select(.Severity == $s) | select($k != "Misconfigurations" or (.Status // "FAIL") == "FAIL")] | length' \
+              "$JSON" 2>/dev/null || echo 0
+          }
+          if [ "$STATUS" = ok ]; then
+            V_C=$(count Vulnerabilities CRITICAL);   V_H=$(count Vulnerabilities HIGH)
+            S_C=$(count Secrets CRITICAL);           S_H=$(count Secrets HIGH)
+            M_C=$(count Misconfigurations CRITICAL); M_H=$(count Misconfigurations HIGH)
+          else
+            V_C=0; V_H=0; S_C=0; S_H=0; M_C=0; M_H=0
+          fi
+          CRIT=$((V_C + S_C + M_C))
+          HIGH=$((V_H + S_H + M_H))
+          TOTAL=$((CRIT + HIGH))
+
+          if [ "$TRIVY_BLOCKING" = "true" ]; then MODE="blocking (trivy_blocking: true)"; else MODE="advisory (trivy_blocking: false — findings do not fail the check)"; fi
+          {
+            echo "## trivy — HIGH/CRITICAL"
+            echo
+            echo "Mode: **${MODE}**"
+            echo
+            if [ "$STATUS" != ok ]; then
+              echo "> Scan did not complete: ${ERR}"
+            else
+              echo "| Scanner | CRITICAL | HIGH |"
+              echo "|---|---:|---:|"
+              echo "| vulnerabilities | ${V_C} | ${V_H} |"
+              echo "| secrets | ${S_C} | ${S_H} |"
+              echo "| misconfigurations | ${M_C} | ${M_H} |"
+              echo "| **total** | **${CRIT}** | **${HIGH}** |"
+              if [ "$TOTAL" -gt 0 ]; then
+                echo
+                echo "<details><summary>Findings (first 50)</summary>"
+                echo
+                echo "| Severity | Type | ID | Detail | Target |"
+                echo "|---|---|---|---|---|"
+                # Secret rows carry the rule id + location only — never the matched value.
+                jq -r '
+                  def esc: tostring | gsub("\\|"; "\\|") | gsub("\n"; " ");
+                  [ .Results[]? as $r
+                    | ( ($r.Vulnerabilities // [])[] | [.Severity, "vuln", .VulnerabilityID, "\(.PkgName) \(.InstalledVersion) -> \(.FixedVersion // "no fix")", $r.Target] ),
+                      ( ($r.Secrets // [])[] | [.Severity, "secret", .RuleID, (.Title // ""), "\($r.Target):\(.StartLine)"] ),
+                      ( ($r.Misconfigurations // [])[] | select((.Status // "FAIL") == "FAIL") | [.Severity, "misconfig", .ID, (.Title // ""), $r.Target] )
+                  ] | sort_by(if .[0] == "CRITICAL" then 0 else 1 end) | .[:50][]
+                  | "| " + (map(esc) | join(" | ")) + " |"' "$JSON" 2>/dev/null
+                echo
+                echo "</details>"
+              fi
+            fi
+            echo
+            echo "Full JSON + SARIF report: \`trivy-report\` artifact on this run."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "trivy: status=${STATUS} critical=${CRIT} high=${HIGH} (vuln ${V_C}/${V_H}, secret ${S_C}/${S_H}, misconfig ${M_C}/${M_H})"
+          if [ "$STATUS" != ok ]; then
+            echo "::warning title=trivy::${ERR}"
+          elif [ "$TOTAL" -gt 0 ]; then
+            echo "::warning title=trivy::${CRIT} critical + ${HIGH} high finding(s) — see the job summary / trivy-report artifact"
+          fi
+          {
+            echo "status=${STATUS}"
+            echo "critical=${CRIT}"
+            echo "high=${HIGH}"
+            echo "total=${TOTAL}"
+          } >> "$GITHUB_OUTPUT"
+          exit 0
+      - name: Upload trivy report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-report
+          path: ${{ runner.temp }}/trivy-report/
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Enforce (only when trivy_blocking is true)
+        if: ${{ inputs.trivy_blocking }}
+        shell: bash
+        env:
+          STATUS: ${{ steps.scan.outputs.status }}
+          TOTAL: ${{ steps.scan.outputs.total }}
+        run: |
+          if [ "$STATUS" != "ok" ]; then
+            echo "::error title=trivy::scan did not complete and trivy_blocking is true"
+            exit 1
+          fi
+          if [ "${TOTAL:-0}" -gt 0 ]; then
+            echo "::error title=trivy::${TOTAL} HIGH/CRITICAL finding(s) and trivy_blocking is true"
+            exit 1
+          fi
+          echo "trivy: no HIGH/CRITICAL findings"
 
   zap-baseline:
-    # Optional, non-blocking at first (dev-environment-research item #7 / install-order day 9):
-    # only runs when the caller passes a preview_url (e.g. once a PR is Ready for review and its
-    # Coolify preview is live). `continue-on-error` until findings have been triaged org-wide.
+    # Opt-in + non-blocking (dev-environment-research item #7): runs only when the caller passes
+    # `preview_url` (e.g. once a PR is Ready for review and its Coolify preview is live).
+    # `fail_action: false` keeps findings advisory. The step-level (NOT job-level)
+    # continue-on-error absorbs infra errors (docker pull, unreachable preview) — at step level
+    # the job still concludes `success`, unlike job-level continue-on-error.
+    # `allow_issue_writing: false`: callers grant no `issues: write`, and findings belong in the
+    # run artifact, not auto-filed issues.
     if: ${{ inputs.preview_url != '' }}
     runs-on: coolify-ci
     timeout-minutes: 15
-    continue-on-error: true
     steps:
       - name: ZAP baseline scan
-        uses: zaproxy/action-baseline@v0.14.0
+        id: zap
+        continue-on-error: true
+        uses: zaproxy/action-baseline@v0.15.0
         with:
           target: ${{ inputs.preview_url }}
           cmd_options: "-z '-silent'"
           fail_action: false
+          allow_issue_writing: false
+          artifact_name: zap-baseline-report
+      - name: ZAP summary
+        if: ${{ always() }}
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.zap.outcome }}
+          TARGET: ${{ inputs.preview_url }}
+        run: |
+          {
+            echo "## ZAP baseline (advisory)"
+            echo
+            echo "Target: ${TARGET}"
+            echo
+            echo "Scan step outcome: **${OUTCOME}** — findings never fail the check; report in the \`zap-baseline-report\` artifact."
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$OUTCOME" != "success" ]; then
+            echo "::warning title=zap-baseline::ZAP scan step did not complete (${OUTCOME}) — check the step log"
+          fi
 
   codeql:
     if: ${{ !inputs.skip-codeql }}
