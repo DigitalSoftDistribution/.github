@@ -38,7 +38,9 @@ on:
 jobs:
   gitleaks:
     runs-on: coolify-ci
-    timeout-minutes: 5
+    # A pull request / push scans only its own commits and finishes in seconds; the full-history scan
+    # is the scheduled / manual run, which needs longer on large histories (kluczesoft-pl, 41k files).
+    timeout-minutes: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 30 || 5 }}
     # Surface the secret into a job-level env var so step `if:` conditions can read
     # it (GitHub Actions forbids `secrets.*` directly inside `if:`).
     env:
@@ -58,14 +60,45 @@ jobs:
       - name: gitleaks (free binary fallback)
         if: ${{ env.GITLEAKS_LICENSE == '' }}
         shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           VERSION=8.21.2
           curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz" \
             | tar -xz -C /tmp gitleaks
+          # Scope (2026-09-27): a pull request scans exactly its own commits (base..head) and a push the
+          # pushed range; only the scheduled / manual run scans the whole history. Scanning the full
+          # history on every PR timed out at 5 min on kluczesoft-pl and turned this advisory check red.
+          # A new-branch push (before = 000…) scans what the default branch does not already have; a
+          # force-push whose `before` is gone falls back to the pushed head commit alone.
+          RANGE=""
+          case "$EVENT" in
+            pull_request|pull_request_target)
+              [ -n "$PR_BASE" ] && [ -n "$PR_HEAD" ] && RANGE="${PR_BASE}..${PR_HEAD}" ;;
+            push)
+              if [ -n "$PUSH_BEFORE" ] && [ "${PUSH_BEFORE//0/}" != "" ] && git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
+                RANGE="${PUSH_BEFORE}..${PUSH_AFTER}"
+              elif [ -n "$DEFAULT_BRANCH" ] && git rev-parse -q --verify "origin/${DEFAULT_BRANCH}^{commit}" >/dev/null; then
+                RANGE="origin/${DEFAULT_BRANCH}..${PUSH_AFTER}"
+              else
+                RANGE="-1 ${PUSH_AFTER}"
+              fi ;;
+          esac
+          args=(detect --source . --redact --no-banner --exit-code 0 --report-format sarif --report-path gitleaks.sarif)
+          if [ -n "$RANGE" ]; then
+            echo "gitleaks: scanning ${EVENT} range ${RANGE}"
+            args+=(--log-opts="$RANGE")
+          else
+            echo "gitleaks: scanning the full history (${EVENT})"
+          fi
           # Advisory: report findings but do not fail the workflow. Hard-blocking on
           # secret detection without triage/allowlisting causes false-positive churn.
-          /tmp/gitleaks detect --source . --redact --no-banner --exit-code 0 \
-            --report-format sarif --report-path gitleaks.sarif || true
+          /tmp/gitleaks "${args[@]}" || true
           COUNT=$(jq '[.runs[]?.results[]?] | length' gitleaks.sarif 2>/dev/null || echo 0)
           echo "gitleaks: $COUNT potential finding(s)"
           if [ "$COUNT" -gt "0" ]; then
