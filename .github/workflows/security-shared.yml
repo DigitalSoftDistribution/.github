@@ -64,6 +64,7 @@ jobs:
           EVENT: ${{ github.event_name }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
           PUSH_BEFORE: ${{ github.event.before }}
           PUSH_AFTER: ${{ github.sha }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
@@ -76,16 +77,31 @@ jobs:
           # history on every PR timed out at 5 min on kluczesoft-pl and turned this advisory check red.
           # A new-branch push (before = 000…) scans what the default branch does not already have; a
           # force-push whose `before` is gone falls back to the pushed head commit alone.
+          # A range whose commits are not in this clone would make gitleaks error out behind `|| true` and
+          # silently scan nothing, so every range is checked first; when it cannot be made valid the job
+          # falls back to the full-history scan (slow, but never a silent skip).
+          have() { git cat-file -e "${1}^{commit}" 2>/dev/null; }
           RANGE=""
           case "$EVENT" in
             pull_request|pull_request_target)
-              [ -n "$PR_BASE" ] && [ -n "$PR_HEAD" ] && RANGE="${PR_BASE}..${PR_HEAD}" ;;
+              # pull_request_target checks out the BASE repository: a fork's head commit is not in it.
+              if [ -n "$PR_HEAD" ] && ! have "$PR_HEAD" && [ -n "$PR_NUMBER" ]; then
+                git fetch --no-tags --quiet origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/origin/pr-head" || true
+              fi
+              if [ -n "$PR_BASE" ] && [ -n "$PR_HEAD" ] && have "$PR_BASE" && have "$PR_HEAD"; then
+                RANGE="${PR_BASE}..${PR_HEAD}"
+              else
+                echo "::warning::gitleaks: PR range ${PR_BASE:0:12}..${PR_HEAD:0:12} not available in this clone; scanning the full history"
+              fi ;;
             push)
-              if [ -n "$PUSH_BEFORE" ] && [ "${PUSH_BEFORE//0/}" != "" ] && git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
+              if [ -n "$PUSH_BEFORE" ] && [ "${PUSH_BEFORE//0/}" != "" ] && have "$PUSH_BEFORE"; then
                 RANGE="${PUSH_BEFORE}..${PUSH_AFTER}"
-              elif [ -n "$DEFAULT_BRANCH" ] && git rev-parse -q --verify "origin/${DEFAULT_BRANCH}^{commit}" >/dev/null; then
+              elif [ -n "$DEFAULT_BRANCH" ] && have "origin/${DEFAULT_BRANCH}" \
+                   && [ "$(git rev-list --count "origin/${DEFAULT_BRANCH}..${PUSH_AFTER}" 2>/dev/null || echo 0)" -gt 0 ]; then
                 RANGE="origin/${DEFAULT_BRANCH}..${PUSH_AFTER}"
               else
+                # before is gone (force-push) and the default branch already equals the pushed head (or is
+                # missing): scan at least the pushed head commit, never an empty range.
                 RANGE="-1 ${PUSH_AFTER}"
               fi ;;
           esac
