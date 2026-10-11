@@ -1,0 +1,34 @@
+# Tests for this repo's own reusable workflows (the shared ones every org repo calls with `uses:`).
+# Org rule: coolify-ci only, never GitHub-hosted runners.
+name: self-test
+
+on:
+  pull_request:
+    paths: ['.github/workflows/**', 'tests/**']
+  push:
+    branches: [main]
+    paths: ['.github/workflows/**', 'tests/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  gitleaks-step:
+    name: security-shared gitleaks step
+    runs-on: coolify-ci
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure PyYAML
+        # ubuntu 24.04 python is externally managed (PEP 668): a venv, put first on PATH, when PyYAML is missing
+        run: |
+          python3 -c 'import yaml' 2>/dev/null && exit 0
+          python3 -m venv "$RUNNER_TEMP/py" && "$RUNNER_TEMP/py/bin/pip" install --quiet pyyaml
+          echo "$RUNNER_TEMP/py/bin" >> "$GITHUB_PATH"
+      - name: Run
+        run: bash tests/gitleaks-step.test.sh

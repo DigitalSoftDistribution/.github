@@ -28,6 +28,13 @@ on:
           Fail the security check when trivy finds HIGH/CRITICAL vulnerabilities, secrets or
           misconfigurations (or cannot complete the scan). Default false = advisory: findings are
           reported in the job summary and the trivy-report artifact but never fail the check.
+      gitleaks_max_rss_mb:
+        type: number
+        default: 4096
+        description: >
+          RSS cap (MB) for the gitleaks run. A watchdog SIGKILLs gitleaks above it, so a pathological history
+          never reaches the job container's memory limit (the runner containers are 10 GB memcgs; gitleaks was
+          kernel-OOM-killed there 12 times on 2026-10-09/10). A killed scan is reported as INCOMPLETE, never as clean.
       preview_url:
         type: string
         default: ""
@@ -68,6 +75,7 @@ jobs:
           PUSH_BEFORE: ${{ github.event.before }}
           PUSH_AFTER: ${{ github.sha }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GL_MAX_RSS_MB: ${{ inputs.gitleaks_max_rss_mb }}
         run: |
           VERSION=8.21.2
           curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz" \
@@ -114,7 +122,31 @@ jobs:
           fi
           # Advisory: report findings but do not fail the workflow. Hard-blocking on
           # secret detection without triage/allowlisting causes false-positive churn.
-          /tmp/gitleaks "${args[@]}" || true
+          #
+          # Memory (2026-10-11): gitleaks was kernel-OOM-killed 12 times on 2026-10-09/10 inside coolify-ci job containers
+          # (beast, cx62, mcp-fleet) at their 10 GB memcg, and with `|| true` a killed scan used to read as "0 findings".
+          # Now GOMEMLIMIT makes its GC work before the cap and a watchdog SIGKILLs it above GL_MAX_RSS_MB, inside the
+          # container's limit; any non-zero exit (killed, crashed) is reported as an INCOMPLETE scan, never as clean.
+          # (`ulimit -v` is no option: gitleaks' regex engine reserves far more address space than any useful cap.)
+          case "$GL_MAX_RSS_MB" in ''|*[!0-9]*|0) echo "::error::gitleaks_max_rss_mb must be a positive integer (got '$GL_MAX_RSS_MB')"; exit 1 ;; esac
+          cap_kb=$((GL_MAX_RSS_MB * 1024)); killed=""
+          rm -f gitleaks.sarif
+          GOMEMLIMIT="$((GL_MAX_RSS_MB * 8 / 10))MiB" /tmp/gitleaks "${args[@]}" &
+          pid=$!
+          while kill -0 "$pid" 2>/dev/null; do
+            rss=$(awk '/^VmRSS:/ { print $2 }' "/proc/$pid/status" 2>/dev/null || true)
+            if [ -n "$rss" ] && [ "$rss" -gt "$cap_kb" ]; then
+              killed="$((rss / 1024))"; kill -KILL "$pid" 2>/dev/null; break
+            fi
+            sleep 0.5
+          done
+          rc=0; wait "$pid" || rc=$?   # the step runs under bash -e: a non-zero wait must not end it
+          if [ "$rc" -ne 0 ]; then
+            why="exited $rc"
+            [ -n "$killed" ] && why="killed at ${killed} MB RSS (cap gitleaks_max_rss_mb=${GL_MAX_RSS_MB})"
+            echo "::warning::gitleaks secret scan INCOMPLETE: gitleaks ${why}. Findings below cover only what it reported before it stopped."
+            echo "### gitleaks: scan incomplete (${why})" >> "$GITHUB_STEP_SUMMARY"
+          fi
           COUNT=$(jq '[.runs[]?.results[]?] | length' gitleaks.sarif 2>/dev/null || echo 0)
           echo "gitleaks: $COUNT potential finding(s)"
           if [ "$COUNT" -gt "0" ]; then
