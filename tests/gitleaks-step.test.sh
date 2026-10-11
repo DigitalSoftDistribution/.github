@@ -4,6 +4,10 @@
 # in a throwaway fixture repository. Needs bash, git, jq, curl, python3 + PyYAML, and Linux (/proc).
 #
 #   bash tests/gitleaks-step.test.sh
+#
+# Not wired into CI on purpose: this repo is PUBLIC, and the org runner group (coolify-ci) does not serve public repos
+# (allows_public_repositories=false, which must stay: a fork PR would run on our hosts). Run it on beast before merging
+# a change to the gitleaks step.
 set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
