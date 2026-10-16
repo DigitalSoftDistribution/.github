@@ -21,6 +21,17 @@ on:
       skip-codeql:
         type: boolean
         default: false
+      codeql-every-push:
+        type: boolean
+        default: false
+        description: >
+          Run CodeQL on every pull request and push too. By default (2026-10-16, G-218) it runs only on
+          the caller's `schedule` and on `workflow_dispatch`. Code Security is not enabled on any org repo,
+          so the per-push SARIF upload fails (continue-on-error below) and the results go nowhere, while
+          each run holds 3.5-6 GB of Java on a shared beast runner for about 4 min. liveagent-ai alone ran
+          75 of them in one day. Four in parallel took beast to load 477 at 06:24Z on 10-15, and CodeQL
+          java was the process the kernel OOM-killed at 07:21Z. Set this true only once Code Security is
+          enabled on the repo AND per-PR alerts are wanted.
       trivy_blocking:
         type: boolean
         default: false
@@ -398,7 +409,9 @@ jobs:
           fi
 
   codeql:
-    if: ${{ !inputs.skip-codeql }}
+    # Default: the caller's weekly schedule and manual dispatch only (see `codeql-every-push`). A skipped job
+    # never fails the call, so callers' `security` gates are unchanged.
+    if: ${{ !inputs.skip-codeql && (inputs.codeql-every-push || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
     runs-on: coolify-ci
     timeout-minutes: 15
     permissions:
