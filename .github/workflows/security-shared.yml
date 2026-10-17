@@ -18,6 +18,13 @@ on:
       language:
         type: string
         default: "javascript-typescript"
+      runner:
+        description: >
+          runs-on label for every job (default the shared coolify-ci pool). A caller routes a hotfix PR to the hotfix
+          lane with: (contains(github.event.pull_request.labels.*.name, 'hotfix') || startsWith(github.head_ref,
+          'hotfix/')) && 'coolify-ci-hotfix' || 'coolify-ci' (beast-infra docs/beast/CI-RUNNERS.md "Hotfix lane", G-218).
+        type: string
+        default: "coolify-ci"
       skip-codeql:
         type: boolean
         default: false
@@ -48,7 +55,7 @@ on:
 
 jobs:
   gitleaks:
-    runs-on: coolify-ci
+    runs-on: ${{ inputs.runner }}
     # A pull request / push scans only its own commits and finishes in seconds; the full-history scan
     # is the scheduled / manual run, which needs longer on large histories (kluczesoft-pl, 41k files).
     timeout-minutes: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 30 || 5 }}
@@ -133,7 +140,7 @@ jobs:
           fi
 
   npm-audit:
-    runs-on: coolify-ci
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -202,7 +209,7 @@ jobs:
     # Deliberately NOT `continue-on-error: true`: at job level GitHub still shows the job as
     # FAILED on the check (that stalled kwn #1865). The scan step instead always exits 0 and a
     # separate "Enforce" step fails the job only when the caller opted in.
-    runs-on: coolify-ci
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 10
     # Least privilege: the scan reads the checkout only (artifact upload uses the runtime token).
     permissions:
@@ -375,7 +382,7 @@ jobs:
     # `allow_issue_writing: false`: callers grant no `issues: write`, and findings belong in the
     # run artifact, not auto-filed issues.
     if: ${{ inputs.preview_url != '' }}
-    runs-on: coolify-ci
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 15
     permissions:
       contents: read
@@ -412,7 +419,7 @@ jobs:
     # Default: the caller's weekly schedule and manual dispatch only (see `codeql-every-push`). A skipped job
     # never fails the call, so callers' `security` gates are unchanged.
     if: ${{ !inputs.skip-codeql && (inputs.codeql-every-push || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
-    runs-on: coolify-ci
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 15
     permissions:
       security-events: write
