@@ -1,0 +1,283 @@
+# Reusable real-device workflow: a repo's Playwright specs on real phones on BrowserStack Automate.
+# beast-infra openspec/changes/real-device-testing (G-218), part 3.
+#
+# A repo opts in with .github/workflows/real-devices.yml (keep that file name: the CC realdevice feed reads the newest
+# run of it) and specs under tests/real-devices/ that import from '@dsd/real-devices' (real-devices/index.mjs):
+#
+#   on:
+#     schedule: [{ cron: '7 1 * * *' }]                     # 01:00-01:59Z, never 02:00-05:00Z
+#     pull_request: { types: [labeled, synchronize] }
+#     workflow_dispatch:
+#   jobs:
+#     real-devices:
+#       if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'real-devices')
+#       uses: DigitalSoftDistribution/.github/.github/workflows/real-devices.yml@main
+#       with: { project: kluczesoft, base_url: https://kluczesoft.pl }
+#       secrets: inherit
+#
+# Do not give the caller job a concurrency group named real-devices-<repo>: the same group on the caller and on this
+# job deadlocks. This job already holds one per repository.
+#
+# Devices (real-devices/devices.mjs): iphone-16-ios18-safari, pixel-9-android15-chrome, desktop-chrome, desktop-safari.
+# Real iOS Safari and real Android Chrome both run as Playwright on BrowserStack:
+#   https://www.browserstack.com/docs/automate/playwright/playwright-ios/nodejs
+#   https://www.browserstack.com/docs/automate/playwright/playwright-android/nodejs
+#
+# Secrets: org Actions secrets BROWSERSTACK_USERNAME and BROWSERSTACK_ACCESS_KEY. Without them the job writes a notice
+# and a `configured: false` results file and ends green: no key, no harm.
+#
+# Outputs: artifact `real-devices-results` (real-devices-results.json, the CC feed's input; keep the name) and
+# artifact `real-devices-report` (Playwright HTML report), plus the job summary.
+#
+# Local proof without a key (same specs, emulated devices, no plan minutes):
+#   cd real-devices && npm ci && npx playwright install chromium webkit
+#   RD_MODE=local RD_SPEC_DIR=<repo>/tests/real-devices RD_BASE_URL=<url> ./run.sh
+name: real-devices
+
+on:
+  workflow_call:
+    inputs:
+      project:
+        description: "Project name: BrowserStack project, build label and results `project` (e.g. kluczesoft, lizensa, aethos)"
+        type: string
+        required: true
+      spec_dir:
+        description: "Directory of the caller's specs, relative to its repo root"
+        type: string
+        default: "tests/real-devices"
+      devices:
+        description: "Comma list of device ids from real-devices/devices.mjs"
+        type: string
+        default: "iphone-16-ios18-safari,pixel-9-android15-chrome"
+      base_url:
+        description: "Site under test (http or https)"
+        type: string
+        required: true
+      max_minutes:
+        description: "Job timeout in minutes; the Playwright run gets this minus 6 so results and the network-log counts are still written"
+        type: number
+        default: 20
+      wait_for_base_url_minutes:
+        description: "How long to wait for base_url to answer 2xx/3xx before failing (e.g. a PR preview that is still building answers 404)"
+        type: number
+        default: 0
+      harness_ref:
+        description: "Ref of DigitalSoftDistribution/.github to take the harness (real-devices/) from"
+        type: string
+        default: "main"
+    secrets:
+      BROWSERSTACK_USERNAME:
+        required: false
+      BROWSERSTACK_ACCESS_KEY:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  real-devices:
+    name: real-devices
+    # Org rule: CI runs on the self-hosted coolify-ci pool only (0 GitHub-hosted minutes).
+    runs-on: coolify-ci
+    timeout-minutes: ${{ inputs.max_minutes }}
+    # One real-device run per repository at a time; a newer run waits, it does not cancel one that holds devices.
+    # Across repositories the plan's own queue holds sessions beyond its parallel limit, and the harness uses one
+    # worker, so a run never opens more than one session at once.
+    concurrency:
+      group: real-devices-${{ github.repository }}
+      cancel-in-progress: false
+    env:
+      BROWSERSTACK_USERNAME: ${{ secrets.BROWSERSTACK_USERNAME }}
+      BROWSERSTACK_ACCESS_KEY: ${{ secrets.BROWSERSTACK_ACCESS_KEY }}
+      RD_PROJECT: ${{ inputs.project }}
+      RD_BASE_URL: ${{ inputs.base_url }}
+      RD_DEVICES: ${{ inputs.devices }}
+      RD_SPEC_INPUT: ${{ inputs.spec_dir }}
+      RD_MAX_MINUTES: ${{ inputs.max_minutes }}
+      RD_WAIT_MINUTES: ${{ inputs.wait_for_base_url_minutes }}
+      RD_EVENT: ${{ github.event_name }}
+      RD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      RD_OUT: ${{ github.workspace }}/rd-out
+    steps:
+      - name: Key present?
+        id: gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RD_OUT"
+          # the job clock starts here: the Playwright budget is what is LEFT of timeout-minutes (review #13)
+          echo "started=$(date +%s)" >> "$GITHUB_OUTPUT"
+          if [ -n "${BROWSERSTACK_USERNAME:-}" ] && [ -n "${BROWSERSTACK_ACCESS_KEY:-}" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "configured=false" >> "$GITHUB_OUTPUT"
+          msg="BrowserStack is not configured (org secrets BROWSERSTACK_USERNAME / BROWSERSTACK_ACCESS_KEY are missing), so no real-device run. Skipped green."
+          echo "::notice title=real-devices skipped::$msg"
+          {
+            echo "### real devices: $RD_PROJECT"
+            echo
+            echo "$msg"
+            echo
+            echo "Target $RD_BASE_URL · devices $RD_DEVICES"
+          } >> "$GITHUB_STEP_SUMMARY"
+          # The CC feed shows `configured: false` from this file rather than guessing from a missing artifact.
+          # shellcheck disable=SC2016 # JavaScript template literals, expanded by node, not by the shell
+          node -e '
+            const e = process.env;
+            const out = {
+              schema: 1, configured: false, mode: "browserstack",
+              repo: e.GITHUB_REPOSITORY, sha: e.RD_SHA,
+              run_url: `${e.GITHUB_SERVER_URL}/${e.GITHUB_REPOSITORY}/actions/runs/${e.GITHUB_RUN_ID}`,
+              event: e.RD_EVENT, project: e.RD_PROJECT, base_url: e.RD_BASE_URL,
+              started_at: new Date().toISOString(), finished_at: new Date().toISOString(),
+              status: "skipped", reason: "BrowserStack secrets are not set",
+              devices: [],
+            };
+            require("fs").writeFileSync(`${e.RD_OUT}/real-devices-results.json`, JSON.stringify(out, null, 2) + "\n");
+          '
+
+      - name: Check out the repository under test
+        if: steps.gate.outputs.configured == 'true'
+        uses: actions/checkout@v4
+        with:
+          path: caller
+          persist-credentials: false
+
+      - name: Check out the harness
+        if: steps.gate.outputs.configured == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: DigitalSoftDistribution/.github
+          ref: ${{ inputs.harness_ref }}
+          path: .rd-harness
+          sparse-checkout: real-devices
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        if: steps.gate.outputs.configured == 'true'
+        with:
+          node-version: "22"
+
+      - name: Install the harness (Playwright client only; the browsers are BrowserStack's)
+        if: steps.gate.outputs.configured == 'true'
+        shell: bash
+        working-directory: .rd-harness/real-devices
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+        run: npm ci --no-audit --no-fund
+
+      - name: Specs and target
+        if: steps.gate.outputs.configured == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          spec="$GITHUB_WORKSPACE/caller/$RD_SPEC_INPUT"
+          if ! ls "$spec"/*.spec.* >/dev/null 2>&1; then
+            echo "::error title=real-devices::no *.spec.* files in $RD_SPEC_INPUT"
+            exit 1
+          fi
+          echo "RD_SPEC_DIR=$spec" >> "$GITHUB_ENV"
+          case "$RD_BASE_URL" in
+            http://*|https://*) ;;
+            *) echo "::error title=real-devices::base_url must be an http(s) URL"; exit 1 ;;
+          esac
+          # A plain client gets a bot-rule 500 from some shops, so ask as a browser does.
+          ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36 real-devices-ci'
+          deadline=$(( $(date +%s) + RD_WAIT_MINUTES * 60 ))
+          while :; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -L --max-time 30 -A "$ua" "$RD_BASE_URL" || echo 000)
+            if [ "$code" -ge 200 ] && [ "$code" -lt 400 ]; then echo "target answers $code"; break; fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error title=real-devices::$RD_BASE_URL answers $code"
+              exit 1
+            fi
+            echo "target answers $code; waiting"
+            sleep 20
+          done
+
+      - name: Run on real devices
+        id: run
+        if: steps.gate.outputs.configured == 'true'
+        shell: bash
+        working-directory: .rd-harness/real-devices
+        env:
+          RD_BUILD: ${{ inputs.project }} ${{ github.repository }}#${{ github.run_number }} ${{ github.event_name }}
+          RD_STARTED: ${{ steps.gate.outputs.started }}
+        run: |
+          set -uo pipefail
+          # The budget is what is LEFT of the job (checkouts, installs and the readiness wait already ran), minus
+          # 6 minutes for the network-log counts, the summary and the uploads. Never clamped up past what is left.
+          elapsed=$(( $(date +%s) - RD_STARTED ))
+          left=$(( RD_MAX_MINUTES * 60 - elapsed - 360 ))
+          code=0
+          if [ "$left" -lt 60 ]; then
+            echo "::warning title=real-devices::only ${left}s of the job left after setup; no real-device run (raise max_minutes)"
+            code=124
+          else
+            export RD_GLOBAL_TIMEOUT_MS=$(( left * 1000 ))
+            ./run.sh
+            code=$?
+          fi
+          echo "exit=$code" >> "$GITHUB_OUTPUT"
+          # Playwright can fail before its reporter exists (an unknown device id, a bad config): still write ONE
+          # configured result so the CC feed sees this run as an error, not as missing (review #13).
+          if [ ! -s "$RD_OUT/real-devices-results.json" ] || grep -q '"configured": false' "$RD_OUT/real-devices-results.json"; then
+            # shellcheck disable=SC2016 # JavaScript template literals, expanded by node, not by the shell
+            RD_CODE=$code node -e '
+              const e = process.env;
+              const out = { schema: 1, configured: true, mode: "browserstack", repo: e.GITHUB_REPOSITORY, sha: e.RD_SHA,
+                run_url: `${e.GITHUB_SERVER_URL}/${e.GITHUB_REPOSITORY}/actions/runs/${e.GITHUB_RUN_ID}`,
+                event: e.RD_EVENT, project: e.RD_PROJECT, base_url: e.RD_BASE_URL,
+                started_at: new Date(Number(e.RD_STARTED) * 1000).toISOString(), finished_at: new Date().toISOString(),
+                status: "error", reason: `the run ended (exit ${e.RD_CODE}) before Playwright wrote results: see the job log`, devices: [] };
+              require("fs").writeFileSync(`${e.RD_OUT}/real-devices-results.json`, JSON.stringify(out, null, 2) + "\n");
+            '
+          fi
+          exit 0
+
+      - name: Count requests in the BrowserStack network logs
+        if: always() && steps.gate.outputs.configured == 'true' && hashFiles('rd-out/real-devices-results.json') != ''
+        shell: bash
+        working-directory: .rd-harness/real-devices
+        env:
+          # one budget for ALL sessions (har-metrics.mjs), inside the 6 minutes the run step left
+          RD_HAR_WAIT_MS: "150000"
+        run: node har-metrics.mjs "$RD_OUT/real-devices-results.json"
+
+      - name: Summary
+        if: always() && steps.gate.outputs.configured == 'true'
+        shell: bash
+        run: node .rd-harness/real-devices/summary.mjs "$RD_OUT/real-devices-results.json" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results (CC realdevice feed)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-devices-results
+          path: rd-out/real-devices-results.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload the HTML report
+        if: always() && steps.gate.outputs.configured == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-devices-report
+          path: |
+            rd-out/html
+            rd-out/test-results
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Verdict
+        if: steps.gate.outputs.configured == 'true'
+        shell: bash
+        env:
+          RUN_EXIT: ${{ steps.run.outputs.exit }}
+        run: |
+          if [ "${RUN_EXIT:-1}" != "0" ]; then
+            echo "::error title=real-devices::Playwright exited ${RUN_EXIT:-without a code}; see the summary and the real-devices-report artifact"
+            exit 1
+          fi
+          echo "all real-device checks passed"

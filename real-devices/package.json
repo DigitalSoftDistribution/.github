@@ -1,0 +1,14 @@
+{
+  "name": "@dsd/real-devices",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Org harness for real-device Playwright runs on BrowserStack (beast-infra openspec real-device-testing, G-218).",
+  "type": "module",
+  "exports": {
+    ".": "./index.mjs",
+    "./devices": "./devices.mjs"
+  },
+  "dependencies": {
+    "@playwright/test": "1.59.1"
+  }
+}
