@@ -15,6 +15,9 @@ if (!file) {
 const user = process.env.BROWSERSTACK_USERNAME;
 const key = process.env.BROWSERSTACK_ACCESS_KEY;
 const WAIT_MS = Number(process.env.RD_HAR_WAIT_MS || 180_000);
+// ONE deadline for the whole script (review #13): a log BrowserStack never serves must not eat the job's time per test
+const DEADLINE = Date.now() + WAIT_MS;
+const REQUEST_TIMEOUT_MS = 20_000;
 const auth = user && key ? `Basic ${Buffer.from(`${user}:${key}`).toString('base64')}` : null;
 
 /** Base64url-decoded query values, so a hit hidden in a parameter (e.g. a Stape loader path) can be matched. */
@@ -33,11 +36,10 @@ function decodedParams(url) {
 }
 
 async function fetchHar(url) {
-  const deadline = Date.now() + WAIT_MS;
   let last = '';
   for (let attempt = 0; ; attempt++) {
     try {
-      const res = await fetch(url, { headers: { Authorization: auth } });
+      const res = await fetch(url, { headers: { Authorization: auth }, signal: AbortSignal.timeout(Math.max(1_000, Math.min(REQUEST_TIMEOUT_MS, DEADLINE - Date.now()))) });
       if (res.ok) {
         const har = await res.json();
         if (Array.isArray(har?.log?.entries)) return har;
@@ -46,14 +48,15 @@ async function fetchHar(url) {
     } catch (err) {
       last = String(err?.message || err);
     }
-    if (Date.now() > deadline) throw new Error(last);
-    await new Promise((r) => setTimeout(r, Math.min(30_000, 5_000 * (attempt + 1))));
+    const left = DEADLINE - Date.now();
+    if (left <= 0) throw new Error(`${last} (gave up: the script's ${Math.round(WAIT_MS / 1000)} s budget is spent)`);
+    await new Promise((r) => setTimeout(r, Math.min(left, 30_000, 5_000 * (attempt + 1))));
   }
 }
 
 function count(har, spec) {
-  const hosts = new RegExp(spec.hosts, spec.hostsFlags || '');
-  const match = new RegExp(spec.match, (spec.matchFlags || '').replace('g', ''));
+  const hosts = new RegExp(spec.hosts, (spec.hostsFlags || '').replace('g', '').replace('y', ''));
+  const match = new RegExp(spec.match, (spec.matchFlags || '').replace('g', '').replace('y', ''));
   const byHost = {};
   let total = 0;
   for (const entry of har.log.entries) {

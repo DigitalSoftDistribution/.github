@@ -105,6 +105,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RD_OUT"
+          # the job clock starts here: the Playwright budget is what is LEFT of timeout-minutes (review #13)
+          echo "started=$(date +%s)" >> "$GITHUB_OUTPUT"
           if [ -n "${BROWSERSTACK_USERNAME:-}" ] && [ -n "${BROWSERSTACK_ACCESS_KEY:-}" ]; then
             echo "configured=true" >> "$GITHUB_OUTPUT"
             exit 0
@@ -201,14 +203,37 @@ jobs:
         working-directory: .rd-harness/real-devices
         env:
           RD_BUILD: ${{ inputs.project }} ${{ github.repository }}#${{ github.run_number }} ${{ github.event_name }}
+          RD_STARTED: ${{ steps.gate.outputs.started }}
         run: |
           set -uo pipefail
-          # Leave 6 minutes of the job for the network-log counts, the summary and the uploads.
-          budget=$(( RD_MAX_MINUTES > 11 ? RD_MAX_MINUTES - 6 : 5 ))
-          export RD_GLOBAL_TIMEOUT_MS=$(( budget * 60 * 1000 ))
-          ./run.sh
-          code=$?
+          # The budget is what is LEFT of the job (checkouts, installs and the readiness wait already ran), minus
+          # 6 minutes for the network-log counts, the summary and the uploads. Never clamped up past what is left.
+          elapsed=$(( $(date +%s) - RD_STARTED ))
+          left=$(( RD_MAX_MINUTES * 60 - elapsed - 360 ))
+          code=0
+          if [ "$left" -lt 60 ]; then
+            echo "::warning title=real-devices::only ${left}s of the job left after setup; no real-device run (raise max_minutes)"
+            code=124
+          else
+            export RD_GLOBAL_TIMEOUT_MS=$(( left * 1000 ))
+            ./run.sh
+            code=$?
+          fi
           echo "exit=$code" >> "$GITHUB_OUTPUT"
+          # Playwright can fail before its reporter exists (an unknown device id, a bad config): still write ONE
+          # configured result so the CC feed sees this run as an error, not as missing (review #13).
+          if [ ! -s "$RD_OUT/real-devices-results.json" ] || grep -q '"configured": false' "$RD_OUT/real-devices-results.json"; then
+            # shellcheck disable=SC2016 # JavaScript template literals, expanded by node, not by the shell
+            RD_CODE=$code node -e '
+              const e = process.env;
+              const out = { schema: 1, configured: true, mode: "browserstack", repo: e.GITHUB_REPOSITORY, sha: e.RD_SHA,
+                run_url: `${e.GITHUB_SERVER_URL}/${e.GITHUB_REPOSITORY}/actions/runs/${e.GITHUB_RUN_ID}`,
+                event: e.RD_EVENT, project: e.RD_PROJECT, base_url: e.RD_BASE_URL,
+                started_at: new Date(Number(e.RD_STARTED) * 1000).toISOString(), finished_at: new Date().toISOString(),
+                status: "error", reason: `the run ended (exit ${e.RD_CODE}) before Playwright wrote results: see the job log`, devices: [] };
+              require("fs").writeFileSync(`${e.RD_OUT}/real-devices-results.json`, JSON.stringify(out, null, 2) + "\n");
+            '
+          fi
           exit 0
 
       - name: Count requests in the BrowserStack network logs
@@ -216,6 +241,7 @@ jobs:
         shell: bash
         working-directory: .rd-harness/real-devices
         env:
+          # one budget for ALL sessions (har-metrics.mjs), inside the 6 minutes the run step left
           RD_HAR_WAIT_MS: "150000"
         run: node har-metrics.mjs "$RD_OUT/real-devices-results.json"
 
