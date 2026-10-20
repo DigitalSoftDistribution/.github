@@ -58,7 +58,7 @@ on:
         type: number
         default: 20
       wait_for_base_url_minutes:
-        description: "How long to wait for base_url to answer below 500 before failing (e.g. a PR preview that is still building)"
+        description: "How long to wait for base_url to answer 2xx/3xx before failing (e.g. a PR preview that is still building answers 404)"
         type: number
         default: 0
       harness_ref:
@@ -185,7 +185,7 @@ jobs:
           deadline=$(( $(date +%s) + RD_WAIT_MINUTES * 60 ))
           while :; do
             code=$(curl -s -o /dev/null -w '%{http_code}' -L --max-time 30 -A "$ua" "$RD_BASE_URL" || echo 000)
-            if [ "$code" -ge 200 ] && [ "$code" -lt 500 ]; then echo "target answers $code"; break; fi
+            if [ "$code" -ge 200 ] && [ "$code" -lt 400 ]; then echo "target answers $code"; break; fi
             if [ "$(date +%s)" -ge "$deadline" ]; then
               echo "::error title=real-devices::$RD_BASE_URL answers $code"
               exit 1
