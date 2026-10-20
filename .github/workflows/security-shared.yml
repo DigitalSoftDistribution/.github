@@ -139,6 +139,95 @@ jobs:
             echo "::warning::gitleaks flagged $COUNT potential secret(s) — review gitleaks.sarif"
           fi
 
+      # MCP client configs (security lane 2026-10-20, G-218): a literal Semrush key and Pipeboard (Meta/Google Ads) tokens sat
+      # in tracked .mcp.json files on main of five repos. gitleaks' generic rules did not flag "Apikey <hex>" or a token in
+      # a URL query. This step parses every tracked MCP client config and names (never prints) each literal credential:
+      # a header value, a secret-named env value, or a token-like URL query parameter that is not an env reference
+      # (${VAR}). A pull request FAILS only for a literal it ADDS (a JSON path whose literal value the base does not already
+      # hold); literals already on the base are warnings, so a repo that still carries an old one is not turned red.
+      - name: mcp config literal secrets
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          base=""
+          if [ "$EVENT" = pull_request ] || [ "$EVENT" = pull_request_target ]; then
+            if git cat-file -e "${PR_BASE}^{commit}" 2>/dev/null; then base="$PR_BASE"; fi
+          fi
+          BASE_SHA="$base" python3 - <<'PY'
+          import hashlib, json, os, re, subprocess, sys, urllib.parse
+          NAMES = re.compile(r"(^|/)(\.?mcp\.json|dotmcp\.json|cline_mcp_settings\.json|claude_desktop_config\.json|mcp_settings\.json)$")
+          SECRET_KEY = re.compile(r"(key|token|secret|password|passwd|credential|auth|bearer|cookie|dsn)", re.I)
+          QUERY_KEY = re.compile(r"^(token|key|api_?key|apikey|access_?token|secret|auth|signature|sig|password)$", re.I)
+          HINT = ("replace the value with an env reference -- \"Authorization\": \"Bearer $"
+                  "{MY_TOKEN}\" or \"?token=$" "{MY_TOKEN}\" -- put the value in Infisical, and have each developer export "
+                  "MY_TOKEN before starting the client (see the repo README or the PR that moved the others)")
+          def literal(v):
+              s = str(v).strip()
+              if not s:
+                  return None
+              stripped = re.sub(r"\$\{[^}]+\}", "", s)
+              word = stripped.split(" ", 1)[1] if " " in stripped else stripped   # "Apikey ${X}" / "Bearer ${X}" -> ""
+              word = word.strip()
+              return hashlib.sha256(word.encode()).hexdigest() if len(word) >= 8 else None
+          def scan(obj, path, hits):
+              if isinstance(obj, dict):
+                  for k, v in obj.items():
+                      p = f"{path}.{k}" if path else str(k)
+                      parent = path.rsplit(".", 1)[-1] if path else ""
+                      if isinstance(v, str):
+                          if parent in ("headers", "env") and (parent == "headers" or SECRET_KEY.search(k)):
+                              h = literal(v)
+                              if h:
+                                  hits[p] = h
+                          elif re.match(r"^[a-z][a-z0-9+.-]*://", v, re.I):
+                              u = urllib.parse.urlsplit(v)
+                              if u.password:
+                                  hits[p + " (password in URL)"] = hashlib.sha256(u.password.encode()).hexdigest()
+                              for qk, qv in urllib.parse.parse_qsl(u.query, keep_blank_values=False):
+                                  h = literal(qv) if QUERY_KEY.match(qk) else None
+                                  if h:
+                                      hits[f"{p} (query {qk})"] = h
+                      else:
+                          scan(v, p, hits)
+              elif isinstance(obj, list):
+                  for i, v in enumerate(obj):
+                      scan(v, f"{path}[{i}]", hits)
+          def hits_of(text):
+              try:
+                  data = json.loads(text)
+              except ValueError:
+                  return None
+              out = {}
+              scan(data, "", out)
+              return out
+          base = os.environ.get("BASE_SHA", "")
+          files = [f for f in subprocess.run(["git", "ls-files"], capture_output=True, text=True).stdout.splitlines() if NAMES.search(f)]
+          fail = 0
+          for f in files:
+              try:
+                  head = hits_of(open(f, encoding="utf-8").read())
+              except OSError:
+                  continue
+              if not head:
+                  continue
+              before = {}
+              if base:
+                  r = subprocess.run(["git", "show", f"{base}:{f}"], capture_output=True, text=True)
+                  before = (hits_of(r.stdout) or {}) if r.returncode == 0 else {}
+              old_values = set(before.values())
+              for path, h in sorted(head.items()):
+                  if base and before.get(path) != h and h not in old_values:
+                      print(f"::error file={f}::this PR adds a literal credential at {path} -- {HINT}")
+                      fail += 1
+                  else:
+                      print(f"::warning file={f}::literal credential at {path} (already on the base) -- {HINT}")
+          print(f"mcp config scan: {len(files)} file(s), {fail} added literal credential(s)")
+          sys.exit(1 if fail else 0)
+          PY
+
   npm-audit:
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 5
