@@ -143,8 +143,8 @@ jobs:
       # in tracked .mcp.json files on main of five repos. gitleaks' generic rules did not flag "Apikey <hex>" or a token in
       # a URL query. This step parses every tracked MCP client config and names (never prints) each literal credential:
       # a header value, a secret-named env value, or a token-like URL query parameter that is not an env reference
-      # (${VAR}). A pull request FAILS only when it changes such a file and leaves a literal in it; a literal already on the
-      # base is a warning (fix it with an env-reference PR; values belong in Infisical).
+      # (${VAR}). A pull request FAILS only for a literal it ADDS (a JSON path whose literal value the base does not already
+      # hold); literals already on the base are warnings, so a repo that still carries an old one is not turned red.
       - name: mcp config literal secrets
         shell: bash
         env:
@@ -152,61 +152,79 @@ jobs:
           PR_BASE: ${{ github.event.pull_request.base.sha }}
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
-          changed=""
+          base=""
           if [ "$EVENT" = pull_request ] || [ "$EVENT" = pull_request_target ]; then
-            if git cat-file -e "${PR_BASE}^{commit}" 2>/dev/null && git cat-file -e "${PR_HEAD}^{commit}" 2>/dev/null; then
-              changed=$(git diff --name-only "$PR_BASE" "$PR_HEAD" || true)
-            fi
+            if git cat-file -e "${PR_BASE}^{commit}" 2>/dev/null; then base="$PR_BASE"; fi
           fi
-          CHANGED="$changed" python3 - <<'PY'
-          import json, os, re, subprocess, sys, urllib.parse
+          BASE_SHA="$base" python3 - <<'PY'
+          import hashlib, json, os, re, subprocess, sys, urllib.parse
           NAMES = re.compile(r"(^|/)(\.?mcp\.json|dotmcp\.json|cline_mcp_settings\.json|claude_desktop_config\.json|mcp_settings\.json)$")
           SECRET_KEY = re.compile(r"(key|token|secret|password|passwd|credential|auth|bearer|cookie|dsn)", re.I)
           QUERY_KEY = re.compile(r"^(token|key|api_?key|apikey|access_?token|secret|auth|signature|sig|password)$", re.I)
+          HINT = ("replace the value with an env reference -- \"Authorization\": \"Bearer $"
+                  "{MY_TOKEN}\" or \"?token=$" "{MY_TOKEN}\" -- put the value in Infisical, and have each developer export "
+                  "MY_TOKEN before starting the client (see the repo README or the PR that moved the others)")
           def literal(v):
               s = str(v).strip()
               if not s:
-                  return False
+                  return None
               stripped = re.sub(r"\$\{[^}]+\}", "", s)
               word = stripped.split(" ", 1)[1] if " " in stripped else stripped   # "Apikey ${X}" / "Bearer ${X}" -> ""
-              return len(word.strip()) >= 8
+              word = word.strip()
+              return hashlib.sha256(word.encode()).hexdigest() if len(word) >= 8 else None
           def scan(obj, path, hits):
               if isinstance(obj, dict):
                   for k, v in obj.items():
                       p = f"{path}.{k}" if path else str(k)
                       parent = path.rsplit(".", 1)[-1] if path else ""
                       if isinstance(v, str):
-                          if (parent in ("headers", "env") and (parent == "headers" or SECRET_KEY.search(k))) and literal(v):
-                              hits.append(p)
+                          if parent in ("headers", "env") and (parent == "headers" or SECRET_KEY.search(k)):
+                              h = literal(v)
+                              if h:
+                                  hits[p] = h
                           elif re.match(r"^[a-z][a-z0-9+.-]*://", v, re.I):
                               u = urllib.parse.urlsplit(v)
                               if u.password:
-                                  hits.append(p + " (password in URL)")
+                                  hits[p + " (password in URL)"] = hashlib.sha256(u.password.encode()).hexdigest()
                               for qk, qv in urllib.parse.parse_qsl(u.query, keep_blank_values=False):
-                                  if QUERY_KEY.match(qk) and literal(qv):
-                                      hits.append(f"{p} (query {qk})")
+                                  h = literal(qv) if QUERY_KEY.match(qk) else None
+                                  if h:
+                                      hits[f"{p} (query {qk})"] = h
                       else:
                           scan(v, p, hits)
               elif isinstance(obj, list):
                   for i, v in enumerate(obj):
                       scan(v, f"{path}[{i}]", hits)
+          def hits_of(text):
+              try:
+                  data = json.loads(text)
+              except ValueError:
+                  return None
+              out = {}
+              scan(data, "", out)
+              return out
+          base = os.environ.get("BASE_SHA", "")
           files = [f for f in subprocess.run(["git", "ls-files"], capture_output=True, text=True).stdout.splitlines() if NAMES.search(f)]
-          changed = set(os.environ.get("CHANGED", "").split())
           fail = 0
           for f in files:
               try:
-                  data = json.load(open(f, encoding="utf-8"))
-              except (OSError, ValueError):
+                  head = hits_of(open(f, encoding="utf-8").read())
+              except OSError:
                   continue
-              hits = []
-              scan(data, "", hits)
-              for h in hits:
-                  if f in changed:
-                      print(f"::error file={f}::literal credential at {h} -- use an env reference (the $VAR form); the value belongs in Infisical")
+              if not head:
+                  continue
+              before = {}
+              if base:
+                  r = subprocess.run(["git", "show", f"{base}:{f}"], capture_output=True, text=True)
+                  before = (hits_of(r.stdout) or {}) if r.returncode == 0 else {}
+              old_values = set(before.values())
+              for path, h in sorted(head.items()):
+                  if base and before.get(path) != h and h not in old_values:
+                      print(f"::error file={f}::this PR adds a literal credential at {path} -- {HINT}")
                       fail += 1
                   else:
-                      print(f"::warning file={f}::literal credential at {h} (already on the base) -- replace it with an env reference")
-          print(f"mcp config scan: {len(files)} file(s), {fail} blocking finding(s)")
+                      print(f"::warning file={f}::literal credential at {path} (already on the base) -- {HINT}")
+          print(f"mcp config scan: {len(files)} file(s), {fail} added literal credential(s)")
           sys.exit(1 if fail else 0)
           PY
 
