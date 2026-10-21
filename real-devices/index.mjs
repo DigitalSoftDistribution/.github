@@ -127,6 +127,21 @@ export const test = base.extend({
         info.annotations.push({ type: 'rd-note', description: `session url unavailable: ${String(err?.message || err).slice(0, 160)}` });
       }
     }
+    // Real iOS (BrowserStack Playwright): a page.route() registered before the first goto left every navigation
+    // hanging ("Failed to navigate ... Timed out waiting for event"; KS and Lizensa, 2026-10-21, both specs route
+    // tracking requests first, Android passed the same specs). iOS cannot see subresource requests anyway
+    // (BrowserStack supported-ios-commands: page.on('request') fires for main navigations only), so a route there
+    // never blocked a tracking hit. On iOS, route()/unroute() become no-ops and the run says so; consent "reject" in
+    // the specs is what keeps those visits out of analytics, and the HAR still counts what was sent.
+    if (MODE === 'browserstack' && spec.kind === 'ios') {
+      const noop = async () => undefined;
+      for (const target of [page, context]) {
+        target.route = noop;
+        target.unroute = noop;
+        target.unrouteAll = noop;
+      }
+      info.annotations.push({ type: 'rd-note', description: 'iOS: page.route() is a no-op here (real iOS hangs navigation on it; tracking requests are not blocked, consent decides)' });
+    }
     await use(session);
 
     const failed = info.status !== info.expectedStatus;
