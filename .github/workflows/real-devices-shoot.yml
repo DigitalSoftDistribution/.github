@@ -1,0 +1,413 @@
+# Reusable real-device VISUAL REGRESSION workflow: shoot an app (or a PR preview) on real phones, tablets and desktops on
+# BrowserStack, diff against the default branch's last shoot, and keep ONE PR comment up to date.
+# beast-infra openspec/changes/real-device-testing + mcp/browserstack `kf-real-device shoot` (G-218). Sibling of
+# real-devices.yml (Playwright specs); this one needs no specs: it walks routes and compares pixels.
+#
+# A repo opts in with .github/workflows/real-devices-shoot.yml:
+#
+#   name: real-devices-shoot
+#   on:
+#     pull_request: { types: [labeled, synchronize] }
+#     push: { branches: [main] }          # the default branch run IS the baseline for every PR
+#     workflow_dispatch:
+#   permissions: { contents: read, actions: read, pull-requests: write }
+#   jobs:
+#     shoot:
+#       if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'real-devices')
+#       uses: DigitalSoftDistribution/.github/.github/workflows/real-devices-shoot.yml@main
+#       with:
+#         app: lizensa-pl
+#         base: ${{ github.event_name == 'pull_request' && format('https://pr-{0}-lizensa.previews.softblaze.net', github.event.number) || '' }}
+#         wait_for_base_url_minutes: 20
+#       secrets: inherit
+#
+# Static or loopback targets (a build folder): build it in an earlier job, upload it with actions/upload-artifact, and pass
+# `site_artifact`. This workflow serves it on 127.0.0.1 and opens a BrowserStack Local tunnel (see inputs).
+#
+# THE BASELINE. The engine diffs against the previous shoot of the same app that it finds in its ledger. A fresh runner
+# has none, so the newest unexpired `real-devices-shoot-<app>` artifact uploaded by a run on the DEFAULT branch is
+# downloaded first and registered in the ledger (real-devices-shoot/baseline.mjs). Every run uploads that artifact, so a
+# default-branch run becomes the next baseline. Routes, devices and themes should match between PR and default branch
+# runs; shots that exist in only one are counted as new or gone. Artifacts expire (30 days here): after that, the next
+# default-branch run restores the baseline.
+#
+# Advisory: a pixel diff never fails the job. A refusal by the budget guard (exit 3) is a warning annotation with the
+# engine's text; so is a run where some sessions failed. A broken run (bad input, no result) fails the job.
+#
+# Secrets: org Actions secrets BROWSERSTACK_USERNAME and BROWSERSTACK_ACCESS_KEY. Without them the job writes a notice and
+# ends green. BEAST_INFRA_TOKEN (optional, read access to the PRIVATE DigitalSoftDistribution/beast-infra) fetches the
+# CLI; inside beast-infra the job's own token is enough. Without a way to read the CLI the job also ends green with a
+# notice. No Percy.
+name: real-devices-shoot
+
+on:
+  workflow_call:
+    inputs:
+      app:
+        description: "Engine preset: cc-demo, cc-live, hermes, lizensa-pl, lizensa-de, lizensa-com, distivo, kluczesoft, aethos. Empty with `urls`."
+        type: string
+        default: ""
+      base:
+        description: "Override the preset base, e.g. https://pr-123-lizensa.previews.softblaze.net. Empty = the preset's own base. Ignored when site_artifact is set."
+        type: string
+        default: ""
+      urls:
+        description: "Comma list of full URLs to shoot (no preset). Used only when `app` is empty."
+        type: string
+        default: ""
+      routes:
+        description: "Comma list of paths or hash routes relative to the base (empty = the preset's list or sitemap)"
+        type: string
+        default: ""
+      devices:
+        description: "core | phones | tablets | desktops | all | comma list of device ids"
+        type: string
+        default: "core"
+      themes:
+        description: "Comma list: light,dark (empty = the preset's default)"
+        type: string
+        default: ""
+      max_routes:
+        description: "Most routes to shoot (engine cap 200). Keep the same value on PR and default branch runs."
+        type: number
+        default: 30
+      caller:
+        description: "Budget caller id. Empty = ci:<repo name>"
+        type: string
+        default: ""
+      site_artifact:
+        description: "Name of an artifact of THIS run holding a built static site. It is served on 127.0.0.1 and shot through BrowserStack Local (the engine rewrites the loopback host to bs-local.com)."
+        type: string
+        default: ""
+      site_entry:
+        description: "Entry file inside site_artifact"
+        type: string
+        default: "index.html"
+      wait_for_base_url_minutes:
+        description: "Wait this long for a public base to answer 2xx/3xx before shooting (a PR preview that is still building answers 404). 0 = do not wait."
+        type: number
+        default: 0
+      pr_number:
+        description: "PR to comment on when the event is not a pull_request (workflow_dispatch). Empty = none."
+        type: string
+        default: ""
+      max_minutes:
+        description: "Job timeout in minutes (a full shoot of 3 devices x 2 themes x 59 routes takes about 25)"
+        type: number
+        default: 45
+      beast_ref:
+        description: "Ref of DigitalSoftDistribution/beast-infra to take the CLI (mcp/browserstack) from"
+        type: string
+        default: "main"
+      harness_ref:
+        description: "Ref of DigitalSoftDistribution/.github to take the helper scripts (real-devices-shoot/) from"
+        type: string
+        default: "main"
+    secrets:
+      BROWSERSTACK_USERNAME:
+        required: false
+      BROWSERSTACK_ACCESS_KEY:
+        required: false
+      BEAST_INFRA_TOKEN:
+        required: false
+    outputs:
+      shoot:
+        description: "Shoot id (empty when nothing was shot)"
+        value: ${{ jobs.shoot.outputs.shoot }}
+      artifact_url:
+        description: "URL of the uploaded gallery artifact"
+        value: ${{ jobs.shoot.outputs.artifact_url }}
+  workflow_dispatch:
+    inputs:
+      app: { description: "Engine preset (cc-demo, lizensa-pl, ...)", type: string, default: "" }
+      base: { description: "Override the preset base", type: string, default: "" }
+      urls: { description: "Comma list of full URLs (when app is empty)", type: string, default: "" }
+      routes: { description: "Comma list of routes", type: string, default: "" }
+      devices: { description: "core | phones | tablets | desktops | all | ids", type: string, default: "core" }
+      themes: { description: "light,dark", type: string, default: "" }
+      max_routes: { description: "Most routes to shoot", type: number, default: 30 }
+      caller: { description: "Budget caller id (empty = ci:<repo name>)", type: string, default: "" }
+      site_artifact: { description: "Artifact of this run holding a built static site", type: string, default: "" }
+      site_entry: { description: "Entry file inside site_artifact", type: string, default: "index.html" }
+      wait_for_base_url_minutes: { description: "Minutes to wait for a public base", type: number, default: 0 }
+      pr_number: { description: "PR to comment on", type: string, default: "" }
+      max_minutes: { description: "Job timeout in minutes", type: number, default: 45 }
+      beast_ref: { description: "beast-infra ref for the CLI", type: string, default: "main" }
+      harness_ref: { description: ".github ref for the helper scripts", type: string, default: "main" }
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: write
+
+jobs:
+  shoot:
+    name: real-devices-shoot
+    # Org rule: CI runs on the self-hosted coolify-ci pool only (0 GitHub-hosted minutes).
+    runs-on: coolify-ci
+    timeout-minutes: ${{ inputs.max_minutes }}
+    # A newer push to the same PR supersedes the older run (the old one only holds device minutes nobody will read).
+    # Default-branch runs are never cancelled: each one is a baseline. Do not give the CALLER job a group with this name.
+    concurrency:
+      group: real-devices-shoot-${{ github.repository }}-${{ inputs.app || 'urls' }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    outputs:
+      shoot: ${{ steps.result.outputs.shoot }}
+      artifact_url: ${{ steps.upload.outputs.artifact-url }}
+    env:
+      RD_APP: ${{ inputs.app }}
+      RD_BASE_IN: ${{ inputs.base }}
+      RD_URLS: ${{ inputs.urls }}
+      RD_ROUTES: ${{ inputs.routes }}
+      RD_DEVICES: ${{ inputs.devices }}
+      RD_THEMES: ${{ inputs.themes }}
+      RD_MAX_ROUTES: ${{ inputs.max_routes }}
+      RD_CALLER: ${{ inputs.caller }}
+      RD_SITE_ARTIFACT: ${{ inputs.site_artifact }}
+      RD_SITE_ENTRY: ${{ inputs.site_entry }}
+      RD_WAIT_MINUTES: ${{ inputs.wait_for_base_url_minutes }}
+      RD_REPO: ${{ github.repository }}
+      RD_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      RD_PR: ${{ github.event.pull_request.number || inputs.pr_number }}
+    steps:
+      - name: Key present?
+        id: gate
+        shell: bash
+        env:
+          BS_USER: ${{ secrets.BROWSERSTACK_USERNAME }}
+          BS_KEY: ${{ secrets.BROWSERSTACK_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -n "${BS_USER:-}" ] && [ -n "${BS_KEY:-}" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "configured=false" >> "$GITHUB_OUTPUT"
+          msg="BrowserStack is not configured (org secrets BROWSERSTACK_USERNAME / BROWSERSTACK_ACCESS_KEY are missing), so no real-device shoot. Skipped green."
+          echo "::notice title=real-devices-shoot skipped::$msg"
+          { echo "### real-devices-shoot"; echo; echo "$msg"; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check out the helper scripts
+        if: steps.gate.outputs.configured == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: DigitalSoftDistribution/.github
+          ref: ${{ inputs.harness_ref }}
+          path: .rds-harness
+          sparse-checkout: real-devices-shoot
+          persist-credentials: false
+
+      - name: Check out the shoot CLI (beast-infra)
+        id: cli_checkout
+        if: steps.gate.outputs.configured == 'true'
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          repository: DigitalSoftDistribution/beast-infra
+          ref: ${{ inputs.beast_ref }}
+          path: .rds-beast-infra
+          sparse-checkout: mcp/browserstack
+          token: ${{ secrets.BEAST_INFRA_TOKEN || github.token }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        if: steps.gate.outputs.configured == 'true'
+        with:
+          node-version: "22"
+
+      - name: Plan
+        id: plan
+        if: steps.gate.outputs.configured == 'true'
+        shell: bash
+        env:
+          HAVE_TOKEN: ${{ secrets.BEAST_INFRA_TOKEN != '' }}
+          BEAST_REF: ${{ inputs.beast_ref }}
+        run: |
+          set -euo pipefail
+          cli=".rds-beast-infra/mcp/browserstack/cli.mjs"
+          if ! grep -q "'shoot'" "$cli" 2>/dev/null; then
+            if [ "$HAVE_TOKEN" = "true" ]; then
+              echo "::error title=real-devices-shoot::the shoot CLI is not in beast-infra@$BEAST_REF (or the checkout failed); merge beast-infra PR 3089 or pass beast_ref"
+              exit 1
+            fi
+            msg="the shoot CLI could not be fetched from the private beast-infra repo (no BEAST_INFRA_TOKEN secret, or beast_ref has no 'shoot' command). Skipped green."
+            echo "::notice title=real-devices-shoot skipped::$msg"
+            { echo "### real-devices-shoot"; echo; echo "$msg"; } >> "$GITHUB_STEP_SUMMARY"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "$RD_APP" ] && [ -z "$RD_URLS" ]; then
+            echo "::error title=real-devices-shoot::give app or urls"
+            exit 1
+          fi
+          if [ -n "$RD_SITE_ARTIFACT" ] && [ -z "$RD_APP" ]; then echo "::error title=real-devices-shoot::site_artifact needs an app preset (cc-demo)"; exit 1; fi
+          case "$RD_BASE_IN" in ""|http://*|https://*) ;; *) echo "::error title=real-devices-shoot::base must be an http(s) URL"; exit 1 ;; esac
+          key=$(node -e 'import(process.argv[1]).then((m) => console.log(m.artifactName(process.argv[2])))' "$GITHUB_WORKSPACE/.rds-harness/real-devices-shoot/baseline.mjs" "${RD_APP:-urls}")
+          local=false
+          if [ -n "$RD_SITE_ARTIFACT" ]; then local=true; fi
+          case "$RD_BASE_IN" in http://127.0.0.1*|http://localhost*|https://dev-*.wt.softblaze.net*) local=true ;; esac
+          mkdir -p "$RUNNER_TEMP/bs" "$RUNNER_TEMP/out"
+          {
+            echo "ready=true"
+            echo "artifact_name=$key"
+            echo "needs_local=$local"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "BROWSERSTACK_LEDGER_DIR=$RUNNER_TEMP/bs"
+            echo "BROWSERSTACK_OUT_DIR=$RUNNER_TEMP/out"
+            echo "RD_APP_KEY=${RD_APP:-urls}"
+          } >> "$GITHUB_ENV"
+
+      - name: Download the static site
+        if: steps.plan.outputs.ready == 'true' && inputs.site_artifact != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.site_artifact }}
+          path: ${{ runner.temp }}/site
+
+      - name: Serve the static site on 127.0.0.1
+        id: site
+        if: steps.plan.outputs.ready == 'true' && inputs.site_artifact != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          site="$RUNNER_TEMP/site"
+          if [ ! -f "$site/$RD_SITE_ENTRY" ]; then
+            echo "::error title=real-devices-shoot::$RD_SITE_ENTRY is not in artifact $RD_SITE_ARTIFACT"
+            exit 1
+          fi
+          portfile="$RUNNER_TEMP/site.port"
+          rm -f "$portfile"
+          nohup node "$GITHUB_WORKSPACE/.rds-harness/real-devices-shoot/static-server.mjs" "$site" "$portfile" >"$RUNNER_TEMP/site.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/site.pid"
+          for _ in $(seq 1 50); do [ -s "$portfile" ] && break; sleep 0.2; done
+          if [ ! -s "$portfile" ]; then echo "::error title=real-devices-shoot::the static server did not start"; exit 1; fi
+          echo "base=http://127.0.0.1:$(cat "$portfile")/$RD_SITE_ENTRY" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for the target
+        if: steps.plan.outputs.ready == 'true' && inputs.site_artifact == '' && inputs.base != '' && inputs.wait_for_base_url_minutes > 0 && steps.plan.outputs.needs_local != 'true'
+        shell: bash
+        run: |
+          set -uo pipefail
+          # A plain client gets a bot-rule 500 from some shops, so ask as a browser does.
+          ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36 real-devices-ci'
+          deadline=$(( $(date +%s) + RD_WAIT_MINUTES * 60 ))
+          while :; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -L --max-time 30 -A "$ua" "$RD_BASE_IN" || echo 000)
+            if [ "$code" -ge 200 ] && [ "$code" -lt 400 ]; then echo "target answers $code"; exit 0; fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error title=real-devices-shoot::$RD_BASE_IN answers $code after ${RD_WAIT_MINUTES} min"
+              exit 1
+            fi
+            echo "target answers $code; waiting"
+            sleep 20
+          done
+
+      - name: Install BrowserStack Local (loopback and static targets only)
+        if: steps.plan.outputs.ready == 'true' && steps.plan.outputs.needs_local == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # shoot-local.mjs resolves `browserstack-local` from the CLI's own folder
+          npm install --prefix .rds-beast-infra/mcp/browserstack --no-save --no-package-lock --no-audit --no-fund browserstack-local
+
+      - name: Restore the default branch baseline
+        id: baseline
+        if: steps.plan.outputs.ready == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RD_BASE: ${{ inputs.app != '' && (steps.site.outputs.base || inputs.base) || '' }}
+        run: node .rds-harness/real-devices-shoot/baseline.mjs restore
+
+      - name: Shoot
+        id: shoot
+        if: steps.plan.outputs.ready == 'true'
+        shell: bash
+        env:
+          BROWSERSTACK_USERNAME: ${{ secrets.BROWSERSTACK_USERNAME }}
+          BROWSERSTACK_ACCESS_KEY: ${{ secrets.BROWSERSTACK_ACCESS_KEY }}
+          RD_BASE: ${{ inputs.app != '' && (steps.site.outputs.base || inputs.base) || '' }}
+        run: |
+          set -uo pipefail
+          caller="${RD_CALLER:-ci:${GITHUB_REPOSITORY#*/}}"
+          if [ -n "$RD_APP" ]; then target="$RD_APP"; else target="$RD_URLS"; fi
+          args=(shoot "$target" --devices "$RD_DEVICES" --max-routes "$RD_MAX_ROUTES" --caller "$caller" --json)
+          [ -n "$RD_BASE" ] && [ -n "$RD_APP" ] && args+=(--base "$RD_BASE")
+          [ -n "$RD_ROUTES" ] && args+=(--routes "$RD_ROUTES")
+          [ -n "$RD_THEMES" ] && args+=(--themes "$RD_THEMES")
+          args+=(--label "ci $GITHUB_REPOSITORY ${RD_PR:+PR #$RD_PR }run $GITHUB_RUN_NUMBER")
+          code=0
+          node .rds-beast-infra/mcp/browserstack/cli.mjs "${args[@]}" > "$RUNNER_TEMP/result.json" 2> "$RUNNER_TEMP/err.txt" || code=$?
+          echo "exit=$code" >> "$GITHUB_OUTPUT"
+          # the engine's progress goes to stderr; show the tail, never the environment
+          tail -n 20 "$RUNNER_TEMP/err.txt" || true
+
+      - name: Locate the shoot folder
+        id: result
+        if: always() && steps.shoot.outcome != 'skipped'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2016 # JavaScript template literal, expanded by node, not by the shell
+          node -e '
+            const fs = require("fs");
+            let r = null;
+            try { r = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); } catch { /* no result */ }
+            const dir = r && r.gallery_url && r.files ? String(r.files) : "";
+            const ok = dir && fs.existsSync(dir + "/manifest.json");
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `dir=${ok ? dir : ""}\nshoot=${ok ? (r.shoot || "") : ""}\n`);
+          ' "$RUNNER_TEMP/result.json"
+
+      - name: Register this shoot as a baseline candidate
+        if: always() && steps.result.outputs.dir != ''
+        shell: bash
+        env:
+          RD_SHOOT: ${{ steps.result.outputs.shoot }}
+          RD_SHOOT_DIR: ${{ steps.result.outputs.dir }}
+        run: node .rds-harness/real-devices-shoot/baseline.mjs pack
+
+      - name: Upload the gallery (the default branch run becomes the next baseline)
+        id: upload
+        if: always() && steps.result.outputs.dir != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.plan.outputs.artifact_name }}
+          path: ${{ steps.result.outputs.dir }}
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Report
+        id: report
+        if: always() && steps.shoot.outcome != 'skipped'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RD_RESULT: ${{ runner.temp }}/result.json
+          RD_ERR: ${{ runner.temp }}/err.txt
+          RD_EXIT: ${{ steps.shoot.outputs.exit }}
+          RD_ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+          RD_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RD_BASELINE: ${{ steps.baseline.outputs.baseline }}
+        run: node .rds-harness/real-devices-shoot/report.mjs
+
+      - name: Stop the static server
+        if: always() && steps.site.outcome != 'skipped'
+        shell: bash
+        run: |
+          pid=$(cat "$RUNNER_TEMP/site.pid" 2>/dev/null || true)
+          if [ -n "$pid" ]; then kill "$pid" 2>/dev/null || true; fi
+
+      - name: Verdict
+        if: always() && steps.plan.outputs.ready == 'true'
+        shell: bash
+        env:
+          VERDICT: ${{ steps.report.outputs.verdict }}
+          KIND: ${{ steps.report.outputs.kind }}
+        run: |
+          # Advisory: a diff, a refusal or failed sessions never fail the job. A broken run does.
+          if [ "${VERDICT:-fail}" = "fail" ]; then
+            echo "::error title=real-devices-shoot::the shoot run broke (${KIND:-no report}); see the log above"
+            exit 1
+          fi
+          echo "real-devices-shoot: ${KIND:-ok}"
