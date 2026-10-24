@@ -46,7 +46,8 @@ on:
         default: false
         description: >
           Fail the gitleaks check when a PULL REQUEST'S OWN commits (base..head) add a secret that the repo's
-          allowlist (.gitleaks.toml / .gitleaksignore) does not cover, or when that range cannot be scanned. Default
+          BASE branch's allowlist (.gitleaks.toml / .gitleaksignore -- never the PR's own copy) does not cover, or
+          when that range cannot be scanned. Default
           false = report-only (G-218 T-3698, 2026-10-24): the count goes to the job summary and a
           `kf-gitleaks-count` log line, and the check stays green. It becomes the default after one week of counts.
           Scheduled / manual full-history scans and pushes never fail on findings (old history is triaged, not
@@ -138,6 +139,21 @@ jobs:
               fi ;;
           esac
           args=(detect --source . --redact --no-banner --exit-code 0 --report-format sarif --report-path gitleaks.sarif)
+          IS_PR=0; case "$EVENT" in pull_request|pull_request_target) IS_PR=1 ;; esac
+          # The allowlist of a pull request comes from its BASE, never its head: a PR that adds a secret could otherwise
+          # allowlist it in the same commit (.gitleaks.toml / .gitleaksignore are read from the checked-out tree).
+          # The head's copies are moved aside for the scan; the base's are passed explicitly when it has them.
+          ASIDE="${RUNNER_TEMP:-/tmp}/gitleaks-head-allowlist.$$"
+          if [ "$IS_PR" = 1 ]; then
+            mkdir -p "$ASIDE"
+            for f in .gitleaks.toml .gitleaksignore; do if [ -e "$f" ]; then mv "$f" "$ASIDE/$f"; fi; done
+            if [ -n "$PR_BASE" ] && git show "${PR_BASE}:.gitleaks.toml" > "$ASIDE/base.gitleaks.toml" 2>/dev/null; then
+              args+=(--config "$ASIDE/base.gitleaks.toml")
+            fi
+            if [ -n "$PR_BASE" ] && git show "${PR_BASE}:.gitleaksignore" > "$ASIDE/base.gitleaksignore" 2>/dev/null; then
+              args+=(--gitleaks-ignore-path "$ASIDE/base.gitleaksignore")
+            fi
+          fi
           if [ -n "$RANGE" ]; then
             echo "gitleaks: scanning ${EVENT} range ${RANGE}"
             args+=(--log-opts="$RANGE")
@@ -148,8 +164,10 @@ jobs:
           # binary, unreadable repo) and is told apart from "found something". The decision is made below.
           rc=0
           /tmp/gitleaks "${args[@]}" || rc=$?
+          if [ "$IS_PR" = 1 ]; then
+            for f in .gitleaks.toml .gitleaksignore; do if [ -e "$ASIDE/$f" ]; then mv "$ASIDE/$f" "$f"; fi; done
+          fi
           COUNT=$(jq '[.runs[]?.results[]?] | length' gitleaks.sarif 2>/dev/null || echo "")
-          IS_PR=0; case "$EVENT" in pull_request|pull_request_target) IS_PR=1 ;; esac
           if [ "$GITLEAKS_BLOCKING" = "true" ]; then MODE=blocking; else MODE=report-only; fi
           # one stable line per run: the report-only week's per-repo counts are read from these (T-3698)
           echo "kf-gitleaks-count repo=${REPO} event=${EVENT} pr=${PR_NUMBER:-} range=${RANGE:-full} count=${COUNT:-error} rc=${rc} mode=${MODE}"
