@@ -6,6 +6,8 @@
 #  - Never block merges on infra/licensing gaps we don't control. Secret + SAST
 #    findings should surface as warnings/annotations, not hard CI failures, until
 #    the org enables the corresponding paid/repo-level features.
+#  - gitleaks is REPORT-ONLY until `gitleaks_blocking: true` (T-3698): then a pull request whose own commits
+#    add a secret outside the allowlist fails, and an unscanned PR fails closed. Full-history scans never block.
 #  - trivy (HIGH/CRITICAL) is ADVISORY on first rollout: counts go to the job summary,
 #    the JSON+SARIF report to the `trivy-report` artifact, and the check stays green.
 #    A repo opts into failing with `trivy_blocking: true`. It scans only the repo's own
@@ -39,6 +41,16 @@ on:
           75 of them in one day. Four in parallel took beast to load 477 at 06:24Z on 10-15, and CodeQL
           java was the process the kernel OOM-killed at 07:21Z. Set this true only once Code Security is
           enabled on the repo AND per-PR alerts are wanted.
+      gitleaks_blocking:
+        type: boolean
+        default: false
+        description: >
+          Fail the gitleaks check when a PULL REQUEST'S OWN commits (base..head) add a secret that the repo's
+          allowlist (.gitleaks.toml / .gitleaksignore) does not cover, or when that range cannot be scanned. Default
+          false = report-only (G-218 T-3698, 2026-10-24): the count goes to the job summary and a
+          `kf-gitleaks-count` log line, and the check stays green. It becomes the default after one week of counts.
+          Scheduled / manual full-history scans and pushes never fail on findings (old history is triaged, not
+          blocked).
       trivy_blocking:
         type: boolean
         default: false
@@ -86,6 +98,8 @@ jobs:
           PUSH_BEFORE: ${{ github.event.before }}
           PUSH_AFTER: ${{ github.sha }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GITLEAKS_BLOCKING: ${{ inputs.gitleaks_blocking }}
+          REPO: ${{ github.repository }}
         run: |
           VERSION=8.21.2
           curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz" \
@@ -130,13 +144,39 @@ jobs:
           else
             echo "gitleaks: scanning the full history (${EVENT})"
           fi
-          # Advisory: report findings but do not fail the workflow. Hard-blocking on
-          # secret detection without triage/allowlisting causes false-positive churn.
-          /tmp/gitleaks "${args[@]}" || true
-          COUNT=$(jq '[.runs[]?.results[]?] | length' gitleaks.sarif 2>/dev/null || echo 0)
+          # --exit-code 0: a finding never makes gitleaks itself fail, so a non-zero exit is an ERROR (bad range, no
+          # binary, unreadable repo) and is told apart from "found something". The decision is made below.
+          rc=0
+          /tmp/gitleaks "${args[@]}" || rc=$?
+          COUNT=$(jq '[.runs[]?.results[]?] | length' gitleaks.sarif 2>/dev/null || echo "")
+          IS_PR=0; case "$EVENT" in pull_request|pull_request_target) IS_PR=1 ;; esac
+          if [ "$GITLEAKS_BLOCKING" = "true" ]; then MODE=blocking; else MODE=report-only; fi
+          # one stable line per run: the report-only week's per-repo counts are read from these (T-3698)
+          echo "kf-gitleaks-count repo=${REPO} event=${EVENT} pr=${PR_NUMBER:-} range=${RANGE:-full} count=${COUNT:-error} rc=${rc} mode=${MODE}"
+          {
+            echo "### gitleaks"
+            echo "- scope: ${RANGE:-full history} (${EVENT})"
+            echo "- findings: ${COUNT:-could not be read} (values are redacted; the SARIF is in the job log annotations)"
+            echo "- mode: ${MODE}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$rc" -ne 0 ] || [ -z "$COUNT" ]; then
+            msg="gitleaks did not complete (exit ${rc}, report ${COUNT:+read}${COUNT:-missing}): this run proves nothing about secrets"
+            # a pull request in blocking mode fails closed: an unscanned PR is never green
+            if [ "$IS_PR" = 1 ] && [ "$MODE" = blocking ]; then echo "::error::$msg"; exit 1; fi
+            echo "::warning::$msg"; exit 0
+          fi
           echo "gitleaks: $COUNT potential finding(s)"
-          if [ "$COUNT" -gt "0" ]; then
-            echo "::warning::gitleaks flagged $COUNT potential secret(s) — review gitleaks.sarif"
+          if [ "$COUNT" -gt 0 ]; then
+            if [ "$IS_PR" = 1 ] && [ -n "$RANGE" ] && [ "$MODE" = blocking ]; then
+              echo "::error::gitleaks: this pull request's commits add $COUNT secret(s) not covered by the allowlist -- remove them (and rotate any that were real), or allowlist a false positive in .gitleaks.toml / .gitleaksignore"
+              exit 1
+            fi
+            if [ "$IS_PR" = 1 ] && [ -z "$RANGE" ] && [ "$MODE" = blocking ]; then
+              # the PR's own range could not be scanned (the full history was): fail closed, never guess
+              echo "::error::gitleaks: the pull request range could not be scanned on its own; $COUNT finding(s) in the full history -- rerun, or fix the checkout"
+              exit 1
+            fi
+            echo "::warning::gitleaks flagged $COUNT potential secret(s) (${MODE}) — review the redacted findings"
           fi
 
       # MCP client configs (security lane 2026-10-20, G-218): a literal Semrush key and Pipeboard (Meta/Google Ads) tokens sat
