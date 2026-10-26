@@ -50,10 +50,19 @@ All three are tiny wrappers calling org-shared reusable workflows in
 **Build is intentionally NOT in CI.** Coolify owns the build step. GitHub
 Actions only validates correctness, never produces a deployable artifact.
 
-**Self-hosted GitHub runners are FORBIDDEN.** Never set `runs-on:
-self-hosted` or `[self-hosted, beast]`. Use `ubuntu-latest`. A
-beamdesk/unit-tests.yml that ran on `self-hosted, beamdesk-beast` was
-the single biggest cause of Beast load spikes — it's been deleted.
+**Every job runs on `runs-on: coolify-ci`, and on nothing else.** That label is
+the org's self-hosted, *ephemeral* runner pool (one container per job, $0
+GitHub-hosted minutes), managed as code in `DigitalSoftDistribution/beast-infra`
+(`ci/`, `docs/beast/CI-RUNNERS.md`). As verified 2026-10-26 it is mostly Beast
+(36 runner containers in lanes: 12 base, 8 x4 burst, 4 platform-reserved, 8 main,
+2 deploy, 2 own), plus mcp-fleet and cx62 while the standby gate has them armed.
+Never use `ubuntu-latest`, `macos-*` or `windows-*` (paid minutes), and never a
+bare `runs-on: self-hosted` or `[self-hosted, beast]` (it matches every pool on
+the org). The old ban was about *persistent* self-hosted runners (a beamdesk
+`unit-tests.yml` on `self-hosted, beamdesk-beast` once caused Beast load spikes;
+it was deleted). Beast is also the dev and agent host, so its load moves job
+timings: a timing-budget check that goes red is not automatically a regression,
+and a check is never rerun just to turn it green.
 
 ## Branch protection (all repos)
 
@@ -138,7 +147,7 @@ Status: `/pipeline-status` skill or `mcp__pr-pipeline__pipeline_health`.
 - Don't bypass branch protection via admin override.
 - Don't run `npm install` / `pnpm build` locally — use `beast install`, `beast build` if working on Beast (the dedicated server has the cached node_modules).
 - Don't create or restore workflow files named `bot-review-gate.yml`, `lighthouse.yml`, `firecrawl-screenshots.yml`, `preview-smoke.yml`, `db-migrate.yml`, `i18n-completeness.yml`, `merge-mate-review.yml` — these were consolidated into the 3-workflow structure today.
-- Don't set `runs-on: self-hosted` or `[self-hosted, beast]` anywhere — these tank Beast.
+- Don't set `runs-on: self-hosted` or `[self-hosted, beast]` anywhere, and don't use `ubuntu-latest` — `runs-on: coolify-ci` is the only allowed label.
 - Don't `VACUUM` Beast's Cursor `state.vscdb` (14 GB, has known issues but user wants it kept intact).
 - Don't reinstall the agent-state-bar Cursor extension below v1.3.0 — earlier versions had `execFileSync` + unbounded globalState bloat that hung the workspace.
 
