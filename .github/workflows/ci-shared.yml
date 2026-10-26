@@ -24,6 +24,10 @@ on:
         description: "runs-on label — self-hosted coolify-ci pool by default (0 cloud minutes). Override to ubuntu-latest only if a job needs the hosted image."
         type: string
         default: "coolify-ci"
+      allow-scratch-paths:
+        description: "Set to true only for a repo that tracks a scratch / probe / output tree on purpose (the scratch guard is then off)"
+        type: boolean
+        default: false
 
 jobs:
   ci:
@@ -42,6 +46,29 @@ jobs:
       NODE_OPTIONS: --max-old-space-size=6144
     steps:
       - uses: actions/checkout@v4
+
+      # SCRATCH GUARD (G-218, 2026-10-26): a PR never ADDS files under an agent's scratch, probe or output tree.
+      # mailbox-layer PR #267 carried 207 probe copies under .scratch/ (+53,023 of its +55,982 lines), committed by a
+      # stage-everything checkpoint. Only added paths are judged (a repo that already tracks one is not broken by it).
+      - name: Scratch guard
+        if: github.event_name == 'pull_request' && !inputs.allow-scratch-paths
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$BASE_SHA" >/dev/null 2>&1 || true
+          if ! git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+            echo "scratch guard: base $BASE_SHA not reachable -- skipped"
+            exit 0
+          fi
+          added=$(git diff --name-only --diff-filter=A "$BASE_SHA" HEAD | grep -E '(^|/)(\.scratch|kf-out|\.kf-out|kf-artifacts|\.kf-evidence)/|\.(orig|rej)$' || true)
+          if [ -n "$added" ]; then
+            n=$(printf '%s\n' "$added" | wc -l | tr -d ' ')
+            echo "::error title=Scratch guard::this PR adds $n file(s) under a scratch / probe / output tree (.scratch/, kf-out/, kf-artifacts/, .kf-evidence/, *.orig, *.rej). Remove them (git rm -r --cached <dir>) and add the dir to .gitignore."
+            printf '%s\n' "$added" | head -40
+            exit 1
+          fi
+          echo "scratch guard: no scratch, probe or output files added"
 
       - uses: pnpm/action-setup@v4
         if: inputs.package-manager == 'pnpm'
