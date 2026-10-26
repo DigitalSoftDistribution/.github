@@ -1,0 +1,251 @@
+# Reusable workflow: the advisory Hallmark design check (sloplint, filtered to seven gates), for web pages that opt in.
+# Decision 2026-10-26 (coordinator, on the Docs audit "Hallmark audit"): adopt partly. Starts with the Orviel landing.
+#
+# What it does: lints SOURCE files (css, html, jsx, tsx, vue, svelte, astro; never dist/build/.next), renders a served
+# build or deployed URLs in headless Chrome at 320 to 1920 px, and reports only gates 40 (field edge contrast), 49a
+# (controls wrap), 73 (text under another element), 75 (tiny text), 25 (line length), 34 (overflow-x), 19 (copy tells).
+# Findings are warnings in the job summary and annotations; they never fail the job. A run that could not render DOES
+# fail it (no puppeteer, no Chrome, a page that did not load, the render tier "not run"): an unrendered page is never a
+# pass. Chrome reaches only 127.0.0.1 and the hosts you pass, so analytics and chat widgets never load.
+#
+# Opt in from the caller (keep it OUT of required checks; the job is advisory):
+#
+#   name: hallmark
+#   on:
+#     pull_request:
+#       paths: ['landing-v2/src/**', 'landing-v2/build.mjs', 'landing-v2/public/**']
+#   jobs:
+#     hallmark:
+#       uses: DigitalSoftDistribution/.github/.github/workflows/hallmark-shared.yml@main
+#       with:
+#         working-directory: landing-v2
+#         install-command: npm ci
+#         build-command: npm run build
+#         static-paths: src
+#         serve-dir: dist
+#         routes: "/ /id/"
+#         genre: atmospheric
+#
+# For a framework app give it a preview instead of a build: `urls: https://pr-12-app.previews.example` (and no serve-dir).
+# Per-repo tuning lives in the caller's .hallmark-profile.json (exclude a selector, add a gate) and a baseline file.
+# Code: hallmark/hallmark-profile.mjs in this repo. Linter: Nutlope/hallmark at the pinned commit below (MIT, unmodified).
+name: hallmark-shared
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: "Directory of the project inside the caller's repo"
+        type: string
+        default: "."
+      install-command:
+        description: "Run in working-directory before the build (empty = none)"
+        type: string
+        default: ""
+      build-command:
+        description: "Run in working-directory to produce serve-dir (empty = none)"
+        type: string
+        default: ""
+      static-paths:
+        description: "Space-separated SOURCE paths to lint, relative to working-directory (empty = no static pass)"
+        type: string
+        default: ""
+      serve-dir:
+        description: "Built directory to serve on loopback and render, relative to working-directory (empty = none)"
+        type: string
+        default: ""
+      routes:
+        description: "Space-separated routes to render from serve-dir"
+        type: string
+        default: "/"
+      urls:
+        description: "Space-separated deployed URLs to render (a PR preview); Chrome may reach only their hosts"
+        type: string
+        default: ""
+      wait-for-url-minutes:
+        description: "Wait this long for the first url to answer 2xx or 3xx (a preview that is still building answers 404). 0 = do not wait."
+        type: number
+        default: 0
+      genre:
+        description: "editorial | modern-minimal | atmospheric | playful (empty = upstream default)"
+        type: string
+        default: ""
+      scope:
+        description: "page | component | app (empty = page)"
+        type: string
+        default: ""
+      baseline:
+        description: "Baseline file in working-directory; with fail-on new only a finding not in it counts"
+        type: string
+        default: ""
+      fail-on:
+        description: "none (advisory, default) | new | any"
+        type: string
+        default: "none"
+      node-version:
+        type: string
+        default: "22"
+      puppeteer-version:
+        description: "puppeteer-core version installed (ignore-scripts) outside the project; 24.43.1 is what our lockfiles carry"
+        type: string
+        default: "24.43.1"
+      hallmark_ref:
+        description: "Full commit sha of Nutlope/hallmark. Pinned: moving it means re-reading the upstream diff (see dsh-plugins skills/hallmark/hallmark/VENDORED.md)."
+        type: string
+        default: "7ec868225c6caa040558c321ee0fefa0e73f83a8"
+      harness_ref:
+        description: "Ref of DigitalSoftDistribution/.github to take hallmark/hallmark-profile.mjs from"
+        type: string
+        default: "main"
+      runner:
+        description: "runs-on label. coolify-ci by default (0 GitHub-hosted minutes)."
+        type: string
+        default: "coolify-ci"
+      max_minutes:
+        type: number
+        default: 20
+
+permissions:
+  contents: read
+
+jobs:
+  hallmark:
+    name: hallmark design check (advisory)
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: ${{ inputs.max_minutes }}
+    # A newer push to the same PR supersedes the older run.
+    concurrency:
+      group: hallmark-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    steps:
+      - name: Pin check
+        shell: bash
+        env:
+          HALLMARK_REF: ${{ inputs.hallmark_ref }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$HALLMARK_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error title=hallmark_ref must be a full commit sha::got '$HALLMARK_REF'. A branch or tag can move under us."
+            exit 2
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check out the profile wrapper (this repo)
+        uses: actions/checkout@v4
+        with:
+          repository: DigitalSoftDistribution/.github
+          ref: ${{ inputs.harness_ref }}
+          path: .hallmark-harness
+          sparse-checkout: hallmark
+          persist-credentials: false
+
+      - name: Check out the linter (Nutlope/hallmark at the pin)
+        uses: actions/checkout@v4
+        with:
+          repository: Nutlope/hallmark
+          ref: ${{ inputs.hallmark_ref }}
+          path: .hallmark-tool
+          sparse-checkout: skills/hallmark/scripts
+          persist-credentials: false
+
+      - name: Verify the linter checkout is the pinned commit
+        shell: bash
+        env:
+          HALLMARK_REF: ${{ inputs.hallmark_ref }}
+        run: |
+          set -euo pipefail
+          got=$(git -C .hallmark-tool rev-parse HEAD)
+          if [ "$got" != "$HALLMARK_REF" ]; then
+            echo "::error title=Hallmark checkout mismatch::expected $HALLMARK_REF, got $got"
+            exit 2
+          fi
+          test -f .hallmark-tool/skills/hallmark/scripts/sloplint.mjs
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Install puppeteer-core (outside the project, no install scripts)
+        shell: bash
+        env:
+          PUP_VERSION: ${{ inputs.puppeteer-version }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/hallmark-pup"
+          mkdir -p "$dir"
+          npm install --prefix "$dir" --no-save --ignore-scripts --no-audit --no-fund "puppeteer-core@${PUP_VERSION}"
+          echo "HALLMARK_PUPPETEER=$dir" >> "$GITHUB_ENV"
+
+      - name: Install the project
+        if: inputs.install-command != ''
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          CMD: ${{ inputs.install-command }}
+        run: bash -c "$CMD"
+
+      - name: Build the project
+        if: inputs.build-command != ''
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          CMD: ${{ inputs.build-command }}
+        run: bash -c "$CMD"
+
+      - name: Wait for the preview
+        if: inputs.urls != '' && inputs.wait-for-url-minutes > 0
+        shell: bash
+        env:
+          URLS: ${{ inputs.urls }}
+          MINUTES: ${{ inputs.wait-for-url-minutes }}
+        run: |
+          set -euo pipefail
+          first=${URLS%% *}
+          end=$(( $(date +%s) + MINUTES * 60 ))
+          until code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$first") && [[ "$code" =~ ^[23] ]]; do
+            if [ "$(date +%s)" -ge "$end" ]; then
+              echo "::error title=Preview never answered::$first answered ${code:-nothing} for ${MINUTES} min. The check cannot render it."
+              exit 2
+            fi
+            sleep 15
+          done
+
+      - name: Hallmark design check
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          STATIC_PATHS: ${{ inputs.static-paths }}
+          SERVE_DIR: ${{ inputs.serve-dir }}
+          ROUTES: ${{ inputs.routes }}
+          URLS: ${{ inputs.urls }}
+          GENRE: ${{ inputs.genre }}
+          SCOPE: ${{ inputs.scope }}
+          BASELINE: ${{ inputs.baseline }}
+          FAIL_ON: ${{ inputs.fail-on }}
+        run: |
+          set -euo pipefail
+          args=(--tool "$GITHUB_WORKSPACE/.hallmark-tool/skills/hallmark/scripts" --out "$GITHUB_WORKSPACE/hallmark-out" --fail-on "$FAIL_ON")
+          for p in $STATIC_PATHS; do args+=(--static "$p"); done
+          if [ -n "$SERVE_DIR" ]; then
+            args+=(--serve "$SERVE_DIR")
+            for r in $ROUTES; do args+=(--route "$r"); done
+          fi
+          for u in $URLS; do args+=(--url "$u"); done
+          [ -z "$GENRE" ] || args+=(--genre "$GENRE")
+          [ -z "$SCOPE" ] || args+=(--scope "$SCOPE")
+          [ -z "$BASELINE" ] || args+=(--baseline "$BASELINE")
+          # exit 0 ran (findings are warnings) / 1 --fail-on tripped / 2 could not run or could not render: all three show red or green as they are.
+          node "$GITHUB_WORKSPACE/.hallmark-harness/hallmark/hallmark-profile.mjs" "${args[@]}"
+
+      - name: Upload the report and screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hallmark-design-check
+          path: hallmark-out
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 14
