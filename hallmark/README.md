@@ -51,4 +51,8 @@ In CI call `.github/workflows/hallmark-shared.yml` (header has a caller example)
 
 ## Rollback
 
-Delete this directory and the two workflows. Callers lose one advisory job.
+Delete this directory and the workflow. Callers lose one advisory job.
+
+## Tests
+
+`node --test "hallmark/test/*.test.mjs"` (17 tests, stub linter, no network or Chrome). There is no self-test workflow here on purpose: this repo is public, the org runner group `Default` does not serve public repositories, so a `coolify-ci` job in it queues forever (the first attempt sat queued for over an hour). Allowing public repos on self-hosted runners would let any fork PR run code on them, so we do not. Run the tests locally on beast when the wrapper changes; the reusable workflow runs in the CALLER repo, which is private and has runners.
