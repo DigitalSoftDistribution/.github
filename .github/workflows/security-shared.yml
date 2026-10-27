@@ -67,6 +67,15 @@ on:
         description: >
           PR preview URL for the ZAP baseline scan (e.g. https://pr-123-lizensa.previews.softblaze.net).
           Leave empty to skip the zap-baseline job entirely — it does not run without a target.
+      skip_heavy_on_draft:
+        type: boolean
+        default: false
+        description: >
+          On a DRAFT pull request, skip the heavy jobs (they report "skipped"); they run when the PR is marked ready.
+          Turn it on ONLY in the same change that adds `ready_for_review` to the caller's `pull_request` types: without
+          that trigger, marking a PR ready starts no new run and the draft's skipped checks would be its latest.
+          Why (G-218 CI stall, 2026-10-27): 117 of 217 queued beast-infra PR runs were on drafts while ready PRs waited
+          50+ minutes for a runner.
       pr_scope:
         type: boolean
         default: true
@@ -317,6 +326,8 @@ jobs:
           PR_BASE: ${{ github.event.pull_request.base.sha }}
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
           PR_SCOPE: ${{ inputs.pr_scope }}
+          DRAFT: ${{ github.event.pull_request.draft }}
+          SKIP_DRAFT: ${{ inputs.skip_heavy_on_draft }}
           TRIVY_BLOCKING: ${{ inputs.trivy_blocking }}
         run: |
           # What npm-audit reads: the package manifest, the lockfiles and the registry config.
@@ -330,7 +341,10 @@ jobs:
           npm=true; trivy=true
           case "$EVENT" in
             pull_request|pull_request_target)
-              if [ "$PR_SCOPE" != true ]; then
+              if [ "$SKIP_DRAFT" = true ] && [ "$DRAFT" = true ]; then
+                npm=false; trivy=false
+                why="a draft pull request: the dependency scanners run when it is marked ready"
+              elif [ "$PR_SCOPE" != true ]; then
                 why="pr_scope is off"
               elif ! git cat-file -e "${PR_BASE}^{commit}" 2>/dev/null || ! git cat-file -e "${PR_HEAD}^{commit}" 2>/dev/null; then
                 why="the pull request range ${PR_BASE:0:12}...${PR_HEAD:0:12} is not in this clone"
@@ -603,7 +617,7 @@ jobs:
     # the job still concludes `success`, unlike job-level continue-on-error.
     # `allow_issue_writing: false`: callers grant no `issues: write`, and findings belong in the
     # run artifact, not auto-filed issues.
-    if: ${{ inputs.preview_url != '' }}
+    if: ${{ inputs.preview_url != '' && !(inputs.skip_heavy_on_draft && github.event.pull_request.draft) }}
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 15
     permissions:
@@ -640,7 +654,7 @@ jobs:
   codeql:
     # Default: the caller's weekly schedule and manual dispatch only (see `codeql-every-push`). A skipped job
     # never fails the call, so callers' `security` gates are unchanged.
-    if: ${{ !inputs.skip-codeql && (inputs.codeql-every-push || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+    if: ${{ !inputs.skip-codeql && (inputs.codeql-every-push || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && !(inputs.skip_heavy_on_draft && github.event.pull_request.draft) }}
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 15
     permissions:
