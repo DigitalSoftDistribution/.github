@@ -13,6 +13,8 @@
 #    A repo opts into failing with `trivy_blocking: true`. It scans only the repo's own
 #    lockfiles/Dockerfiles/IaC, so a finding is always actionable by that repo.
 #  - ZAP baseline is opt-in (pass `preview_url`) and never blocks.
+#  - On a pull request, npm-audit and trivy run only when the PR changes what they read (`pr_scope`, default true);
+#    gitleaks and the MCP literal scan run on every PR, and push / schedule / dispatch always scan in full.
 name: security-shared
 on:
   workflow_call:
@@ -65,6 +67,18 @@ on:
         description: >
           PR preview URL for the ZAP baseline scan (e.g. https://pr-123-lizensa.previews.softblaze.net).
           Leave empty to skip the zap-baseline job entirely — it does not run without a target.
+      pr_scope:
+        type: boolean
+        default: true
+        description: >
+          On a PULL REQUEST, run the two advisory dependency scanners only when the pull request changes what they
+          read: npm-audit when it changes a package manifest, lockfile or .npmrc; trivy when it changes a dependency
+          manifest or lockfile, a container or IaC file, or the trivy config (and ALWAYS when trivy_blocking is true).
+          Otherwise the job reports "skipped", which passes like any skipped check. gitleaks and the MCP literal scan
+          run on every pull request either way; push, schedule and workflow_dispatch run every scanner in full.
+          Why (G-218 CI CPU, 2026-10-27): 2,000 pull-request security runs in 48 h each started two runner containers
+          for a 10-25 s advisory scan whose input the pull request had not touched (over 90 % of them), about 3,700
+          container starts on the shared pool. Set false to scan every pull request.
 
 jobs:
   gitleaks:
@@ -76,6 +90,11 @@ jobs:
     # it (GitHub Actions forbids `secrets.*` directly inside `if:`).
     env:
       GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+    # Which advisory scanners this run needs (the `scope` step, last in this job). Anything but 'false' runs the scanner,
+    # so a scope step that never ran (cancelled, crashed) fails open: npm-audit and trivy run as before.
+    outputs:
+      npm_audit: ${{ steps.scope.outputs.npm_audit }}
+      trivy: ${{ steps.scope.outputs.trivy }}
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
@@ -286,7 +305,60 @@ jobs:
           sys.exit(1 if fail else 0)
           PY
 
+      # pr_scope (see the input): decide here, in a job that already has the full history checked out, so the two
+      # scanners a pull request does not need never start a runner container at all. `!cancelled()`: it also runs when a
+      # step above failed, so a red gitleaks never skips the dependency scans. Every path that cannot decide says 'true'.
+      - name: scope (which advisory scanners this run needs)
+        id: scope
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PR_SCOPE: ${{ inputs.pr_scope }}
+          TRIVY_BLOCKING: ${{ inputs.trivy_blocking }}
+        run: |
+          # What npm-audit reads: the package manifest, the lockfiles and the registry config.
+          NPM_RE='(^|/)(package\.json|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|yarn\.lock|\.npmrc)$'
+          # What `trivy fs --scanners vuln,secret,misconfig` reads for vulnerabilities and misconfigurations: dependency
+          # manifests and lockfiles of every ecosystem trivy supports, Dockerfiles / Containerfiles / compose files,
+          # Terraform / HCL / Bicep, Helm and Kubernetes trees, CloudFormation, bundled archives, and trivy's own config.
+          # (Its secret scanner reads every file: on a pull request gitleaks + the MCP literal scan cover the PR's own
+          # commits, and the push to the default branch runs trivy over the whole tree.)
+          TRIVY_RE='(^|/)(package\.json|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|requirements[^/]*\.(txt|in)|constraints[^/]*\.txt|Pipfile(\.lock)?|poetry\.lock|pyproject\.toml|uv\.lock|pdm\.lock|setup\.(py|cfg)|go\.(mod|sum|work)|Cargo\.(toml|lock)|Gemfile(\.lock)?|[^/]*\.gemspec|composer\.(json|lock)|pom\.xml|build\.gradle(\.kts)?|gradle\.lockfile|[^/]*\.(csproj|vbproj|fsproj|sln)|packages\.(config|lock\.json)|Directory\.Packages\.props|mix\.lock|pubspec\.lock|Package\.resolved|Podfile\.lock|conan\.lock|[^/]*Dockerfile[^/]*|[^/]*\.dockerfile|Containerfile[^/]*|[^/]*compose[^/]*\.ya?ml|[^/]*\.(tf|tfvars|tf\.json|hcl|bicep)|Chart\.ya?ml|values[^/]*\.ya?ml|\.trivyignore(\.yaml)?|trivy\.ya?ml|[^/]*\.(jar|war|ear))$|(^|/)(k8s|kubernetes|manifests|helm|charts|deploy|cloudformation|templates)/'
+          npm=true; trivy=true
+          case "$EVENT" in
+            pull_request|pull_request_target)
+              if [ "$PR_SCOPE" != true ]; then
+                why="pr_scope is off"
+              elif ! git cat-file -e "${PR_BASE}^{commit}" 2>/dev/null || ! git cat-file -e "${PR_HEAD}^{commit}" 2>/dev/null; then
+                why="the pull request range ${PR_BASE:0:12}...${PR_HEAD:0:12} is not in this clone"
+              elif ! files=$(git diff --name-only "${PR_BASE}...${PR_HEAD}"); then
+                why="git diff ${PR_BASE:0:12}...${PR_HEAD:0:12} failed"
+              else
+                n=$(printf '%s' "$files" | grep -c . || true)
+                grep -qE "$NPM_RE" <<<"$files" || npm=false
+                if [ "$TRIVY_BLOCKING" != true ] && ! grep -qE "$TRIVY_RE" <<<"$files"; then trivy=false; fi
+                why="the pull request changes ${n} file(s)"
+              fi ;;
+            *) why="a ${EVENT} run scans in full" ;;
+          esac
+          echo "npm_audit=${npm}" >> "$GITHUB_OUTPUT"
+          echo "trivy=${trivy}" >> "$GITHUB_OUTPUT"
+          # one stable line per run, so the skip rate can be counted from the logs (G-218 CI CPU)
+          echo "kf-security-scope event=${EVENT} npm_audit=${npm} trivy=${trivy} reason=\"${why}\""
+          {
+            echo "### advisory scanners for this run"
+            echo "- npm-audit: $([ "$npm" = true ] && echo runs || echo "skipped (no manifest, lockfile or .npmrc changed)")"
+            echo "- trivy: $([ "$trivy" = true ] && echo runs || echo "skipped (no dependency, container or IaC file changed)")"
+            echo "- why: ${why}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   npm-audit:
+    needs: gitleaks
+    # Skipped (a passing check) only when the scope step said 'false'; see the pr_scope input.
+    if: ${{ !cancelled() && needs.gitleaks.outputs.npm_audit != 'false' }}
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 5
     steps:
@@ -356,6 +428,9 @@ jobs:
     # Deliberately NOT `continue-on-error: true`: at job level GitHub still shows the job as
     # FAILED on the check (that stalled kwn #1865). The scan step instead always exits 0 and a
     # separate "Enforce" step fails the job only when the caller opted in.
+    needs: gitleaks
+    # Skipped (a passing check) only when the scope step said 'false', which it never does with trivy_blocking: true.
+    if: ${{ !cancelled() && needs.gitleaks.outputs.trivy != 'false' }}
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 10
     # Least privilege: the scan reads the checkout only (artifact upload uses the runtime token).
