@@ -24,13 +24,33 @@ on:
         description: "runs-on label — self-hosted coolify-ci pool by default (0 cloud minutes). Override to ubuntu-latest only if a job needs the hosted image."
         type: string
         default: "coolify-ci"
+      skip_heavy_on_draft:
+        type: boolean
+        default: false
+        description: >
+          On a DRAFT pull request, skip the heavy jobs (they report "skipped"); they run when the PR is marked ready.
+          Turn it on ONLY in the same change that adds `ready_for_review` to the caller's `pull_request` types: without
+          that trigger, marking a PR ready starts no new run and the draft's skipped checks would be its latest.
+          Why (G-218 CI stall, 2026-10-27): 117 of 217 queued beast-infra PR runs were on drafts while ready PRs waited
+          50+ minutes for a runner.
       allow-scratch-paths:
         description: "Set to true only for a repo that tracks a scratch / probe / output tree on purpose (the scratch guard is then off)"
         type: boolean
         default: false
 
 jobs:
+  # The one cheap signal a draft gets when skip_heavy_on_draft is on: says why `ci` was skipped. Seconds, no checkout.
+  draft:
+    if: ${{ inputs.skip_heavy_on_draft && github.event.pull_request.draft }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 2
+    steps:
+      - run: |
+          echo "draft pull request: typecheck, lint and test run once it is marked ready (skip_heavy_on_draft)"
+          echo "- draft: \`ci\` runs when this PR is marked ready" >> "$GITHUB_STEP_SUMMARY"
+
   ci:
+    if: ${{ !(inputs.skip_heavy_on_draft && github.event.pull_request.draft) }}
     runs-on: ${{ inputs.runner }}
     # Typecheck + lint + test run serially in this single job with no turbo
     # remote cache, so large monorepos (e.g. keyflow, tracklayer) rebuild
