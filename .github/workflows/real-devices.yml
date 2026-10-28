@@ -252,15 +252,19 @@ jobs:
 
       - name: Upload results (CC realdevice feed)
         if: always()
+        # a full artifact quota must never fail the job (G-218); the scan or test verdict is decided by its own step
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: real-devices-results
           path: rd-out/real-devices-results.json
           if-no-files-found: warn
-          retention-days: 30
+          retention-days: 7
 
       - name: Upload the HTML report
         if: always() && steps.gate.outputs.configured == 'true'
+        # a full artifact quota must never fail the job (G-218); the scan or test verdict is decided by its own step
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: real-devices-report
@@ -268,7 +272,7 @@ jobs:
             rd-out/html
             rd-out/test-results
           if-no-files-found: ignore
-          retention-days: 14
+          retention-days: 7
 
       - name: Verdict
         if: steps.gate.outputs.configured == 'true'
