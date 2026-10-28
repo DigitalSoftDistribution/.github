@@ -29,6 +29,18 @@ on:
           'hotfix/')) && 'coolify-ci-hotfix' || 'coolify-ci' (beast-infra docs/beast/CI-RUNNERS.md "Hotfix lane", G-218).
         type: string
         default: "coolify-ci"
+      main_runner:
+        type: string
+        default: "coolify-ci-main"
+        description: >
+          runs-on label for a PUSH to the repository's default branch, used only while `runner` is the plain shared
+          pool (`coolify-ci`); a caller that names any other runner keeps it. "" keeps main on `runner`.
+          Why (G-218, 2026-10-27): main's ci + security runs queued 10-26 min for a runner behind ~220 pull-request
+          jobs on the same `coolify-ci` label (kf security 21 min, zephr ci 26 min), and the merge gate holds every
+          green PR of the repo until main's run settles: 92 green PRs waited with 0 merges a round. `coolify-ci-main`
+          is the beast main lane (gha-runner-main@21..28, beast-infra ci/install-lanes.sh): a pull-request job asking
+          for `coolify-ci` reaches only the lane runners lent to the shared pool (/etc/beast-ci/lanes-shared).
+          Schedule / workflow_dispatch / pull_request runs stay on `runner`.
       skip-codeql:
         type: boolean
         default: false
@@ -91,7 +103,7 @@ on:
 
 jobs:
   gitleaks:
-    runs-on: ${{ inputs.runner }}
+    runs-on: ${{ (inputs.main_runner != '' && inputs.runner == 'coolify-ci' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) && inputs.main_runner || inputs.runner }}
     # A pull request / push scans only its own commits and finishes in seconds; the full-history scan
     # is the scheduled / manual run, which needs longer on large histories (kluczesoft-pl, 41k files).
     timeout-minutes: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 30 || 5 }}
@@ -373,7 +385,7 @@ jobs:
     needs: gitleaks
     # Skipped (a passing check) only when the scope step said 'false'; see the pr_scope input.
     if: ${{ !cancelled() && needs.gitleaks.outputs.npm_audit != 'false' }}
-    runs-on: ${{ inputs.runner }}
+    runs-on: ${{ (inputs.main_runner != '' && inputs.runner == 'coolify-ci' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) && inputs.main_runner || inputs.runner }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -445,7 +457,7 @@ jobs:
     needs: gitleaks
     # Skipped (a passing check) only when the scope step said 'false', which it never does with trivy_blocking: true.
     if: ${{ !cancelled() && needs.gitleaks.outputs.trivy != 'false' }}
-    runs-on: ${{ inputs.runner }}
+    runs-on: ${{ (inputs.main_runner != '' && inputs.runner == 'coolify-ci' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) && inputs.main_runner || inputs.runner }}
     timeout-minutes: 10
     # Least privilege: the scan reads the checkout only (artifact upload uses the runtime token).
     permissions:
@@ -618,7 +630,7 @@ jobs:
     # `allow_issue_writing: false`: callers grant no `issues: write`, and findings belong in the
     # run artifact, not auto-filed issues.
     if: ${{ inputs.preview_url != '' && !(inputs.skip_heavy_on_draft && github.event.pull_request.draft) }}
-    runs-on: ${{ inputs.runner }}
+    runs-on: ${{ (inputs.main_runner != '' && inputs.runner == 'coolify-ci' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) && inputs.main_runner || inputs.runner }}
     timeout-minutes: 15
     permissions:
       contents: read
@@ -655,7 +667,7 @@ jobs:
     # Default: the caller's weekly schedule and manual dispatch only (see `codeql-every-push`). A skipped job
     # never fails the call, so callers' `security` gates are unchanged.
     if: ${{ !inputs.skip-codeql && (inputs.codeql-every-push || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && !(inputs.skip_heavy_on_draft && github.event.pull_request.draft) }}
-    runs-on: ${{ inputs.runner }}
+    runs-on: ${{ (inputs.main_runner != '' && inputs.runner == 'coolify-ci' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) && inputs.main_runner || inputs.runner }}
     timeout-minutes: 15
     permissions:
       security-events: write

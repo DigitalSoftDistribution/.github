@@ -24,6 +24,18 @@ on:
         description: "runs-on label — self-hosted coolify-ci pool by default (0 cloud minutes). Override to ubuntu-latest only if a job needs the hosted image."
         type: string
         default: "coolify-ci"
+      main_runner:
+        type: string
+        default: "coolify-ci-main"
+        description: >
+          runs-on label for a PUSH to the repository's default branch, used only while `runner` is the plain shared
+          pool (`coolify-ci`); a caller that names any other runner keeps it. "" keeps main on `runner`.
+          Why (G-218, 2026-10-27): main's ci + security runs queued 10-26 min for a runner behind ~220 pull-request
+          jobs on the same `coolify-ci` label (kf security 21 min, zephr ci 26 min), and the merge gate holds every
+          green PR of the repo until main's run settles: 92 green PRs waited with 0 merges a round. `coolify-ci-main`
+          is the beast main lane (gha-runner-main@21..28, beast-infra ci/install-lanes.sh): a pull-request job asking
+          for `coolify-ci` reaches only the lane runners lent to the shared pool (/etc/beast-ci/lanes-shared).
+          Schedule / workflow_dispatch / pull_request runs stay on `runner`.
       skip_heavy_on_draft:
         type: boolean
         default: false
@@ -42,7 +54,7 @@ jobs:
   # The one cheap signal a draft gets when skip_heavy_on_draft is on: says why `ci` was skipped. Seconds, no checkout.
   draft:
     if: ${{ inputs.skip_heavy_on_draft && github.event.pull_request.draft }}
-    runs-on: ${{ inputs.runner }}
+    runs-on: ${{ (inputs.main_runner != '' && inputs.runner == 'coolify-ci' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) && inputs.main_runner || inputs.runner }}
     timeout-minutes: 2
     steps:
       - run: |
@@ -51,7 +63,7 @@ jobs:
 
   ci:
     if: ${{ !(inputs.skip_heavy_on_draft && github.event.pull_request.draft) }}
-    runs-on: ${{ inputs.runner }}
+    runs-on: ${{ (inputs.main_runner != '' && inputs.runner == 'coolify-ci' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) && inputs.main_runner || inputs.runner }}
     # Typecheck + lint + test run serially in this single job with no turbo
     # remote cache, so large monorepos (e.g. keyflow, tracklayer) rebuild
     # upstream packages cold for each phase. History: 10m -> 20m -> 40m. 20m
