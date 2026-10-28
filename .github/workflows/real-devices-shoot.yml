@@ -370,12 +370,14 @@ jobs:
       - name: Upload the gallery (the default branch run becomes the next baseline)
         id: upload
         if: always() && steps.result.outputs.dir != ''
+        # a full artifact quota must never fail the job (G-218); the scan or test verdict is decided by its own step; 14 days keeps the default-branch baseline alive
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.plan.outputs.artifact_name }}
           path: ${{ steps.result.outputs.dir }}
           if-no-files-found: warn
-          retention-days: 30
+          retention-days: 14
 
       - name: Report
         id: report

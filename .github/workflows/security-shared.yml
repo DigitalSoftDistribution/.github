@@ -598,12 +598,14 @@ jobs:
           exit 0
       - name: Upload trivy report
         if: ${{ always() }}
+        # a full artifact quota must never fail the job (G-218); the scan or test verdict is decided by its own step
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: trivy-report
           path: ${{ runner.temp }}/trivy-report/
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: 3
       - name: Enforce (only when trivy_blocking is true)
         if: ${{ inputs.trivy_blocking }}
         shell: bash

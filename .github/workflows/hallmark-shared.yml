@@ -242,10 +242,12 @@ jobs:
 
       - name: Upload the report and screenshots
         if: always()
+        # a full artifact quota must never fail the job (G-218); the scan or test verdict is decided by its own step
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: hallmark-design-check
           path: hallmark-out
           include-hidden-files: true
           if-no-files-found: ignore
-          retention-days: 14
+          retention-days: 7
