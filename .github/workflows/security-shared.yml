@@ -438,8 +438,14 @@ jobs:
           dir="$RUNNER_TEMP/npm-audit-src"
           rm -rf "$dir" && mkdir "$dir"
           for f in package.json pnpm-lock.yaml package-lock.json; do
-            # a symlink would hand the audit (and the registry) whatever file it points at
-            if [ -f "$f" ] && [ ! -L "$f" ]; then cp "$f" "$dir/"; fi
+            # A symlink would hand the audit (and the registry) whatever file it points at, and a package.json that was
+            # skipped would turn the audit off ("nothing to audit", exit 0). So anything at these names that is not a
+            # plain file fails the job; only a repository with no package.json at all skips the audit.
+            if [ -L "$f" ] || { [ -e "$f" ] && [ ! -f "$f" ]; }; then
+              echo "::error::$f is a symlink or not a regular file: the npm audit does not follow it"
+              exit 1
+            fi
+            if [ -f "$f" ]; then cp "$f" "$dir/"; fi
           done
           # its own workspace root: without this file pnpm walks UP from runner.temp, and a pnpm-workspace.yaml left in an
           # ancestor (the persistent work dir) would become the root -- its registry, its pnpmfile, no lockfile
