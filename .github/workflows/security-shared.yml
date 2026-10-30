@@ -400,29 +400,54 @@ jobs:
         # 2026-09-24: a pnpm-lock.yaml alone is not proof the repo uses pnpm. dsh-plugins
         # carries both lockfiles, installs with `npm ci`, and has no packageManager field,
         # so pnpm/action-setup died with "No pnpm version is specified". Order:
-        #   packageManager: pnpm@x -> pnpm (action reads the exact version)
+        #   packageManager: pnpm@x -> pnpm
         #   package-lock.json      -> npm
-        #   pnpm-lock.yaml only    -> pnpm, explicit major (no packageManager to read)
+        #   pnpm-lock.yaml only    -> pnpm
+        # The pnpm version itself is pinned below (G-218), never read from the PR.
         run: |
           PM=$(jq -r '.packageManager // ""' package.json 2>/dev/null || true)
           if [[ "$PM" == pnpm@* ]]; then
             echo "manager=pnpm" >> "$GITHUB_OUTPUT"
-            echo "pnpm_version=" >> "$GITHUB_OUTPUT"
           elif [ -f package-lock.json ]; then
             echo "manager=npm" >> "$GITHUB_OUTPUT"
           elif [ -f pnpm-lock.yaml ]; then
             echo "manager=pnpm" >> "$GITHUB_OUTPUT"
-            echo "pnpm_version=10" >> "$GITHUB_OUTPUT"
           else
             echo "manager=npm" >> "$GITHUB_OUTPUT"
           fi
-      # `version` is empty whenever package.json has a packageManager field, so the
-      # action reads that exact value. Pinning a major there conflicts with a precise
-      # packageManager (e.g. pnpm@9.15.4) and fails with ERR_PNPM_BAD_PM_VERSION.
+      # G-218 (30.10): the audit must not run anything the PR chooses on a runner whose $HOME persists across jobs.
+      # pnpm/action-setup copies $GITHUB_WORKSPACE/.npmrc into its dest and installs pnpm from that registry, reads
+      # the pnpm version from the PR's package.json, and by default installs into ~/setup-pnpm (persistent /gha-cache).
+      # So: the PR's .npmrc is deleted from the checkout, npm config comes from an empty userconfig plus the public
+      # registry, pnpm is one pinned version (the org's packageManager, published 2026-03-24), installed into
+      # runner.temp, and pnpm never switches to the packageManager version or loads a .pnpmfile. The pinned version
+      # reads lockfile v9 (pnpm 9/10/11 repos); a mismatch with packageManager is a warning, and the audit is advisory.
+      - name: Keep the PR's npm config out of the audit
+        id: npmcfg
+        shell: bash
+        env:
+          PNPM_PIN: "10.33.0"
+        run: |
+          set -euo pipefail
+          rm -f .npmrc
+          : > "$RUNNER_TEMP/npm-audit-userconfig"
+          # pnpm/action-setup reads `packageManager` from this file instead of the PR's package.json (an exact pin and a
+          # different packageManager would otherwise fail with "Multiple versions of pnpm specified").
+          rm -rf .npm-audit-pnpm && mkdir .npm-audit-pnpm && printf '{"private":true}\n' > .npm-audit-pnpm/package.json
+          {
+            echo "NPM_CONFIG_USERCONFIG=$RUNNER_TEMP/npm-audit-userconfig"
+            echo "npm_config_registry=https://registry.npmjs.org/"
+            echo "npm_config_manage_package_manager_versions=false"
+            echo "npm_config_package_manager_strict=false"
+            echo "npm_config_ignore_pnpmfile=true"
+          } >> "$GITHUB_ENV"
+          echo "pnpm_version=$PNPM_PIN" >> "$GITHUB_OUTPUT"
       - uses: pnpm/action-setup@v4
         if: steps.pkgmgr.outputs.manager == 'pnpm'
         with:
-          version: ${{ steps.pkgmgr.outputs.pnpm_version }}
+          version: ${{ steps.npmcfg.outputs.pnpm_version }}
+          dest: ${{ runner.temp }}/setup-pnpm
+          package_json_file: .npm-audit-pnpm/package.json
       # No `cache: pnpm` here: the audit doesn't need a warm store and the cache
       # Post-step has been flaky (fails the job after an otherwise-green audit).
       - uses: actions/setup-node@v4
