@@ -476,7 +476,10 @@ jobs:
       - name: Audit (findings are advisory; an audit that did not run fails)
         shell: bash
         run: |
-          set -uo pipefail
+          # GitHub runs `shell: bash` as `bash -e -o pipefail`, and npm/pnpm audit exit non-zero whenever they FIND
+          # something: with -e on, any finding killed this step before a line was printed (liveagent-ai, run 41096880034).
+          # So -e is off here, the audit's exit code is kept, and the REPORT decides.
+          set +e -uo pipefail
           # Findings are advisory: print them, never fail on them (the fix path is Dependabot PRs). But an audit that did
           # not RUN (an error, no lockfile, a registry failure, an ancestor taking over the root) is not "0 findings": it
           # fails this job, so a broken audit is red instead of a silent "0 critical, 0 high" (G-218, aa318 on #25).
@@ -487,27 +490,30 @@ jobs:
             exit 0
           fi
           if [ "${{ steps.pkgmgr.outputs.manager }}" = "pnpm" ]; then
-            pnpm audit --prod --json --config.ignore-pnpmfile=true --registry=https://registry.npmjs.org/ > audit.json 2> audit.err
+            rc=0
+            pnpm audit --prod --json --config.ignore-pnpmfile=true --registry=https://registry.npmjs.org/ > audit.json 2> audit.err \
+              || rc=$?
             ran='has("advisories") and (has("error") | not)'
             high_q='[.advisories[] | select(.severity=="high")] | length'
             crit_q='[.advisories[] | select(.severity=="critical")] | length'
           else
             # --prefix + --workspaces=false: npm must not adopt an ancestor package.json that lists this dir as a workspace
+            rc=0
             npm audit --omit=dev --json --registry=https://registry.npmjs.org/ --prefix "$dir" --workspaces=false \
-              > audit.json 2> audit.err
+              > audit.json 2> audit.err || rc=$?
             ran='has("vulnerabilities") and has("metadata") and (has("error") | not)'
             high_q='.metadata.vulnerabilities.high // 0'
             crit_q='.metadata.vulnerabilities.critical // 0'
           fi
           if ! jq -e "$ran" audit.json > /dev/null 2>&1; then
-            echo "::error::the ${{ steps.pkgmgr.outputs.manager }} audit did not run (no advisory report): see below"
+            echo "::error::the ${{ steps.pkgmgr.outputs.manager }} audit did not run (no advisory report, exit $rc): see below"
             jq -c '.error // empty' audit.json 2> /dev/null | head -c 600 || head -c 600 audit.json
             head -c 800 audit.err
             exit 1
           fi
           HIGH=$(jq "$high_q" audit.json)
           CRIT=$(jq "$crit_q" audit.json)
-          echo "Audit (${{ steps.pkgmgr.outputs.manager }}): $CRIT critical, $HIGH high"
+          echo "Audit (${{ steps.pkgmgr.outputs.manager }}): $CRIT critical, $HIGH high (audit exit $rc)"
           if [ "$CRIT" -gt "0" ]; then
             echo "::warning::$CRIT critical npm advisories — open a Dependabot PR or update manually"
           fi
