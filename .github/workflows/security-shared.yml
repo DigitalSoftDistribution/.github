@@ -389,6 +389,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       # 2026-07-28: not every consuming repo uses pnpm (e.g. liveagent-ai is
       # plain npm/package-lock.json). pnpm/action-setup hard-fails on a repo
       # with no packageManager field and no pnpm-lock.yaml -- that failure
@@ -422,6 +424,9 @@ jobs:
       # registry, pnpm is one pinned version (the org's packageManager, published 2026-03-24), installed into
       # runner.temp, and pnpm never switches to the packageManager version or loads a .pnpmfile. The pinned version
       # reads lockfile v9 (pnpm 9/10/11 repos); a mismatch with packageManager is a warning, and the audit is advisory.
+      # The audit itself runs in a clean dir under runner.temp that holds only package.json and the lockfile, so no
+      # .npmrc, pnpm-workspace.yaml (registry, pnpmfile, settings) or .pnpmfile from the PR is in reach; for a pnpm
+      # workspace the lockfile's importers carry every package, so the report is the same (checked on adnexus-ai).
       - name: Keep the PR's npm config out of the audit
         id: npmcfg
         shell: bash
@@ -429,7 +434,14 @@ jobs:
           PNPM_PIN: "10.33.0"
         run: |
           set -euo pipefail
-          rm -f .npmrc
+          rm -f .npmrc .pnpmfile.*
+          dir="$RUNNER_TEMP/npm-audit-src"
+          rm -rf "$dir" && mkdir "$dir"
+          for f in package.json pnpm-lock.yaml package-lock.json; do
+            # a symlink would hand the audit (and the registry) whatever file it points at
+            if [ -f "$f" ] && [ ! -L "$f" ]; then cp "$f" "$dir/"; fi
+          done
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
           : > "$RUNNER_TEMP/npm-audit-userconfig"
           # pnpm/action-setup reads `packageManager` from this file instead of the PR's package.json (an exact pin and a
           # different packageManager would otherwise fail with "Multiple versions of pnpm specified").
@@ -456,12 +468,15 @@ jobs:
         shell: bash
         run: |
           # Advisory: print but don't fail. Real fix path is Dependabot PRs.
+          # The clean dir from the isolation step; `--config.ignore-pnpmfile` (pnpm audit has no --ignore-pnpmfile flag:
+          # it would fail the audit as an unknown option and report 0 advisories).
+          cd "${{ steps.npmcfg.outputs.dir }}"
           if [ "${{ steps.pkgmgr.outputs.manager }}" = "pnpm" ]; then
-            pnpm audit --prod --json > audit.json 2>&1 || true
+            pnpm audit --prod --json --config.ignore-pnpmfile=true --registry=https://registry.npmjs.org/ > audit.json 2>&1 || true
             HIGH=$(jq '[.advisories[]? | select(.severity=="high")] | length' audit.json 2>/dev/null || echo 0)
             CRIT=$(jq '[.advisories[]? | select(.severity=="critical")] | length' audit.json 2>/dev/null || echo 0)
           else
-            npm audit --omit=dev --json > audit.json 2>&1 || true
+            npm audit --omit=dev --json --registry=https://registry.npmjs.org/ > audit.json 2>&1 || true
             HIGH=$(jq '.metadata.vulnerabilities.high // 0' audit.json 2>/dev/null || echo 0)
             CRIT=$(jq '.metadata.vulnerabilities.critical // 0' audit.json 2>/dev/null || echo 0)
           fi
