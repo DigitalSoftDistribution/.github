@@ -441,6 +441,9 @@ jobs:
             # a symlink would hand the audit (and the registry) whatever file it points at
             if [ -f "$f" ] && [ ! -L "$f" ]; then cp "$f" "$dir/"; fi
           done
+          # its own workspace root: without this file pnpm walks UP from runner.temp, and a pnpm-workspace.yaml left in an
+          # ancestor (the persistent work dir) would become the root -- its registry, its pnpmfile, no lockfile
+          printf 'packages:\n  - "."\n' > "$dir/pnpm-workspace.yaml"
           echo "dir=$dir" >> "$GITHUB_OUTPUT"
           : > "$RUNNER_TEMP/npm-audit-userconfig"
           # pnpm/action-setup reads `packageManager` from this file instead of the PR's package.json (an exact pin and a
@@ -464,22 +467,40 @@ jobs:
       # Post-step has been flaky (fails the job after an otherwise-green audit).
       - uses: actions/setup-node@v4
         with: { node-version: "22" }
-      - name: Audit (advisory only — never fails the workflow)
+      - name: Audit (findings are advisory; an audit that did not run fails)
         shell: bash
         run: |
-          # Advisory: print but don't fail. Real fix path is Dependabot PRs.
-          # The clean dir from the isolation step; `--config.ignore-pnpmfile` (pnpm audit has no --ignore-pnpmfile flag:
-          # it would fail the audit as an unknown option and report 0 advisories).
-          cd "${{ steps.npmcfg.outputs.dir }}"
-          if [ "${{ steps.pkgmgr.outputs.manager }}" = "pnpm" ]; then
-            pnpm audit --prod --json --config.ignore-pnpmfile=true --registry=https://registry.npmjs.org/ > audit.json 2>&1 || true
-            HIGH=$(jq '[.advisories[]? | select(.severity=="high")] | length' audit.json 2>/dev/null || echo 0)
-            CRIT=$(jq '[.advisories[]? | select(.severity=="critical")] | length' audit.json 2>/dev/null || echo 0)
-          else
-            npm audit --omit=dev --json --registry=https://registry.npmjs.org/ > audit.json 2>&1 || true
-            HIGH=$(jq '.metadata.vulnerabilities.high // 0' audit.json 2>/dev/null || echo 0)
-            CRIT=$(jq '.metadata.vulnerabilities.critical // 0' audit.json 2>/dev/null || echo 0)
+          set -uo pipefail
+          # Findings are advisory: print them, never fail on them (the fix path is Dependabot PRs). But an audit that did
+          # not RUN (an error, no lockfile, a registry failure, an ancestor taking over the root) is not "0 findings": it
+          # fails this job, so a broken audit is red instead of a silent "0 critical, 0 high" (G-218, aa318 on #25).
+          dir="${{ steps.npmcfg.outputs.dir }}"
+          cd "$dir"
+          if [ ! -f package.json ]; then
+            echo "No package.json in the repository root: nothing to audit."
+            exit 0
           fi
+          if [ "${{ steps.pkgmgr.outputs.manager }}" = "pnpm" ]; then
+            pnpm audit --prod --json --config.ignore-pnpmfile=true --registry=https://registry.npmjs.org/ > audit.json 2> audit.err
+            ran='has("advisories") and (has("error") | not)'
+            high_q='[.advisories[] | select(.severity=="high")] | length'
+            crit_q='[.advisories[] | select(.severity=="critical")] | length'
+          else
+            # --prefix + --workspaces=false: npm must not adopt an ancestor package.json that lists this dir as a workspace
+            npm audit --omit=dev --json --registry=https://registry.npmjs.org/ --prefix "$dir" --workspaces=false \
+              > audit.json 2> audit.err
+            ran='has("vulnerabilities") and has("metadata") and (has("error") | not)'
+            high_q='.metadata.vulnerabilities.high // 0'
+            crit_q='.metadata.vulnerabilities.critical // 0'
+          fi
+          if ! jq -e "$ran" audit.json > /dev/null 2>&1; then
+            echo "::error::the ${{ steps.pkgmgr.outputs.manager }} audit did not run (no advisory report): see below"
+            jq -c '.error // empty' audit.json 2> /dev/null | head -c 600 || head -c 600 audit.json
+            head -c 800 audit.err
+            exit 1
+          fi
+          HIGH=$(jq "$high_q" audit.json)
+          CRIT=$(jq "$crit_q" audit.json)
           echo "Audit (${{ steps.pkgmgr.outputs.manager }}): $CRIT critical, $HIGH high"
           if [ "$CRIT" -gt "0" ]; then
             echo "::warning::$CRIT critical npm advisories — open a Dependabot PR or update manually"
