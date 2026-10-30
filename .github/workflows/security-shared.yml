@@ -389,6 +389,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       # 2026-07-28: not every consuming repo uses pnpm (e.g. liveagent-ai is
       # plain npm/package-lock.json). pnpm/action-setup hard-fails on a repo
       # with no packageManager field and no pnpm-lock.yaml -- that failure
@@ -400,46 +402,111 @@ jobs:
         # 2026-09-24: a pnpm-lock.yaml alone is not proof the repo uses pnpm. dsh-plugins
         # carries both lockfiles, installs with `npm ci`, and has no packageManager field,
         # so pnpm/action-setup died with "No pnpm version is specified". Order:
-        #   packageManager: pnpm@x -> pnpm (action reads the exact version)
+        #   packageManager: pnpm@x -> pnpm
         #   package-lock.json      -> npm
-        #   pnpm-lock.yaml only    -> pnpm, explicit major (no packageManager to read)
+        #   pnpm-lock.yaml only    -> pnpm
+        # The pnpm version itself is pinned below (G-218), never read from the PR.
         run: |
           PM=$(jq -r '.packageManager // ""' package.json 2>/dev/null || true)
           if [[ "$PM" == pnpm@* ]]; then
             echo "manager=pnpm" >> "$GITHUB_OUTPUT"
-            echo "pnpm_version=" >> "$GITHUB_OUTPUT"
           elif [ -f package-lock.json ]; then
             echo "manager=npm" >> "$GITHUB_OUTPUT"
           elif [ -f pnpm-lock.yaml ]; then
             echo "manager=pnpm" >> "$GITHUB_OUTPUT"
-            echo "pnpm_version=10" >> "$GITHUB_OUTPUT"
           else
             echo "manager=npm" >> "$GITHUB_OUTPUT"
           fi
-      # `version` is empty whenever package.json has a packageManager field, so the
-      # action reads that exact value. Pinning a major there conflicts with a precise
-      # packageManager (e.g. pnpm@9.15.4) and fails with ERR_PNPM_BAD_PM_VERSION.
+      # G-218 (30.10): the audit must not run anything the PR chooses on a runner whose $HOME persists across jobs.
+      # pnpm/action-setup copies $GITHUB_WORKSPACE/.npmrc into its dest and installs pnpm from that registry, reads
+      # the pnpm version from the PR's package.json, and by default installs into ~/setup-pnpm (persistent /gha-cache).
+      # So: the PR's .npmrc is deleted from the checkout, npm config comes from an empty userconfig plus the public
+      # registry, pnpm is one pinned version (the org's packageManager, published 2026-03-24), installed into
+      # runner.temp, and pnpm never switches to the packageManager version or loads a .pnpmfile. The pinned version
+      # reads lockfile v9 (pnpm 9/10/11 repos); a mismatch with packageManager is a warning, and the audit is advisory.
+      # The audit itself runs in a clean dir under runner.temp that holds only package.json and the lockfile, so no
+      # .npmrc, pnpm-workspace.yaml (registry, pnpmfile, settings) or .pnpmfile from the PR is in reach; for a pnpm
+      # workspace the lockfile's importers carry every package, so the report is the same (checked on adnexus-ai).
+      - name: Keep the PR's npm config out of the audit
+        id: npmcfg
+        shell: bash
+        env:
+          PNPM_PIN: "10.33.0"
+        run: |
+          set -euo pipefail
+          rm -f .npmrc .pnpmfile.*
+          dir="$RUNNER_TEMP/npm-audit-src"
+          rm -rf "$dir" && mkdir "$dir"
+          for f in package.json pnpm-lock.yaml package-lock.json; do
+            # A symlink would hand the audit (and the registry) whatever file it points at, and a package.json that was
+            # skipped would turn the audit off ("nothing to audit", exit 0). So anything at these names that is not a
+            # plain file fails the job; only a repository with no package.json at all skips the audit.
+            if [ -L "$f" ] || { [ -e "$f" ] && [ ! -f "$f" ]; }; then
+              echo "::error::$f is a symlink or not a regular file: the npm audit does not follow it"
+              exit 1
+            fi
+            if [ -f "$f" ]; then cp "$f" "$dir/"; fi
+          done
+          # its own workspace root: without this file pnpm walks UP from runner.temp, and a pnpm-workspace.yaml left in an
+          # ancestor (the persistent work dir) would become the root -- its registry, its pnpmfile, no lockfile
+          printf 'packages:\n  - "."\n' > "$dir/pnpm-workspace.yaml"
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+          : > "$RUNNER_TEMP/npm-audit-userconfig"
+          # pnpm/action-setup reads `packageManager` from this file instead of the PR's package.json (an exact pin and a
+          # different packageManager would otherwise fail with "Multiple versions of pnpm specified").
+          rm -rf .npm-audit-pnpm && mkdir .npm-audit-pnpm && printf '{"private":true}\n' > .npm-audit-pnpm/package.json
+          {
+            echo "NPM_CONFIG_USERCONFIG=$RUNNER_TEMP/npm-audit-userconfig"
+            echo "npm_config_registry=https://registry.npmjs.org/"
+            echo "npm_config_manage_package_manager_versions=false"
+            echo "npm_config_package_manager_strict=false"
+            echo "npm_config_ignore_pnpmfile=true"
+          } >> "$GITHUB_ENV"
+          echo "pnpm_version=$PNPM_PIN" >> "$GITHUB_OUTPUT"
       - uses: pnpm/action-setup@v4
         if: steps.pkgmgr.outputs.manager == 'pnpm'
         with:
-          version: ${{ steps.pkgmgr.outputs.pnpm_version }}
+          version: ${{ steps.npmcfg.outputs.pnpm_version }}
+          dest: ${{ runner.temp }}/setup-pnpm
+          package_json_file: .npm-audit-pnpm/package.json
       # No `cache: pnpm` here: the audit doesn't need a warm store and the cache
       # Post-step has been flaky (fails the job after an otherwise-green audit).
       - uses: actions/setup-node@v4
         with: { node-version: "22" }
-      - name: Audit (advisory only — never fails the workflow)
+      - name: Audit (findings are advisory; an audit that did not run fails)
         shell: bash
         run: |
-          # Advisory: print but don't fail. Real fix path is Dependabot PRs.
-          if [ "${{ steps.pkgmgr.outputs.manager }}" = "pnpm" ]; then
-            pnpm audit --prod --json > audit.json 2>&1 || true
-            HIGH=$(jq '[.advisories[]? | select(.severity=="high")] | length' audit.json 2>/dev/null || echo 0)
-            CRIT=$(jq '[.advisories[]? | select(.severity=="critical")] | length' audit.json 2>/dev/null || echo 0)
-          else
-            npm audit --omit=dev --json > audit.json 2>&1 || true
-            HIGH=$(jq '.metadata.vulnerabilities.high // 0' audit.json 2>/dev/null || echo 0)
-            CRIT=$(jq '.metadata.vulnerabilities.critical // 0' audit.json 2>/dev/null || echo 0)
+          set -uo pipefail
+          # Findings are advisory: print them, never fail on them (the fix path is Dependabot PRs). But an audit that did
+          # not RUN (an error, no lockfile, a registry failure, an ancestor taking over the root) is not "0 findings": it
+          # fails this job, so a broken audit is red instead of a silent "0 critical, 0 high" (G-218, aa318 on #25).
+          dir="${{ steps.npmcfg.outputs.dir }}"
+          cd "$dir"
+          if [ ! -f package.json ]; then
+            echo "No package.json in the repository root: nothing to audit."
+            exit 0
           fi
+          if [ "${{ steps.pkgmgr.outputs.manager }}" = "pnpm" ]; then
+            pnpm audit --prod --json --config.ignore-pnpmfile=true --registry=https://registry.npmjs.org/ > audit.json 2> audit.err
+            ran='has("advisories") and (has("error") | not)'
+            high_q='[.advisories[] | select(.severity=="high")] | length'
+            crit_q='[.advisories[] | select(.severity=="critical")] | length'
+          else
+            # --prefix + --workspaces=false: npm must not adopt an ancestor package.json that lists this dir as a workspace
+            npm audit --omit=dev --json --registry=https://registry.npmjs.org/ --prefix "$dir" --workspaces=false \
+              > audit.json 2> audit.err
+            ran='has("vulnerabilities") and has("metadata") and (has("error") | not)'
+            high_q='.metadata.vulnerabilities.high // 0'
+            crit_q='.metadata.vulnerabilities.critical // 0'
+          fi
+          if ! jq -e "$ran" audit.json > /dev/null 2>&1; then
+            echo "::error::the ${{ steps.pkgmgr.outputs.manager }} audit did not run (no advisory report): see below"
+            jq -c '.error // empty' audit.json 2> /dev/null | head -c 600 || head -c 600 audit.json
+            head -c 800 audit.err
+            exit 1
+          fi
+          HIGH=$(jq "$high_q" audit.json)
+          CRIT=$(jq "$crit_q" audit.json)
           echo "Audit (${{ steps.pkgmgr.outputs.manager }}): $CRIT critical, $HIGH high"
           if [ "$CRIT" -gt "0" ]; then
             echo "::warning::$CRIT critical npm advisories — open a Dependabot PR or update manually"
