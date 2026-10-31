@@ -86,6 +86,8 @@ on:
           On a DRAFT pull request, skip the heavy jobs (they report "skipped"); they run when the PR is marked ready.
           Turn it on ONLY in the same change that adds `ready_for_review` to the caller's `pull_request` types: without
           that trigger, marking a PR ready starts no new run and the draft's skipped checks would be its latest.
+          The caller's token also needs pull-requests: read for the skip: the scope step reads the PR, because the
+          payload can be stale (T-5808), and without that read the scanners simply run on a draft.
           Why (G-218 CI stall, 2026-10-27): 117 of 217 queued beast-infra PR runs were on drafts while ready PRs waited
           50+ minutes for a runner.
       pr_scope:
@@ -116,15 +118,16 @@ jobs:
     outputs:
       npm_audit: ${{ steps.scope.outputs.npm_audit }}
       trivy: ${{ steps.scope.outputs.trivy }}
+      draft: ${{ steps.scope.outputs.draft }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { fetch-depth: 0 }
       # gitleaks-action@v2 requires a paid GITLEAKS_LICENSE for ORG repos. When the
       # license secret is present, use the action (richer reporting). Otherwise fall
       # back to the free open-source gitleaks binary so secret scanning still runs.
       - name: gitleaks (licensed action)
         if: ${{ env.GITLEAKS_LICENSE != '' }}
-        uses: gitleaks/gitleaks-action@v2
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
         env:
           GITHUB_TOKEN: ${{ github.token }}
           GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
@@ -340,6 +343,8 @@ jobs:
           PR_SCOPE: ${{ inputs.pr_scope }}
           DRAFT: ${{ github.event.pull_request.draft }}
           SKIP_DRAFT: ${{ inputs.skip_heavy_on_draft }}
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
           TRIVY_BLOCKING: ${{ inputs.trivy_blocking }}
         run: |
           # What npm-audit reads: the package manifest, the lockfiles and the registry config.
@@ -351,9 +356,17 @@ jobs:
           # commits, and the push to the default branch runs trivy over the whole tree.)
           TRIVY_RE='(^|/)(package\.json|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|requirements[^/]*\.(txt|in)|constraints[^/]*\.txt|Pipfile(\.lock)?|poetry\.lock|pyproject\.toml|uv\.lock|pdm\.lock|setup\.(py|cfg)|go\.(mod|sum|work)|Cargo\.(toml|lock)|Gemfile(\.lock)?|[^/]*\.gemspec|composer\.(json|lock)|pom\.xml|build\.gradle(\.kts)?|gradle\.lockfile|[^/]*\.(csproj|vbproj|fsproj|sln)|packages\.(config|lock\.json)|Directory\.Packages\.props|mix\.lock|pubspec\.lock|Package\.resolved|Podfile\.lock|conan\.lock|[^/]*Dockerfile[^/]*|[^/]*\.dockerfile|Containerfile[^/]*|[^/]*compose[^/]*\.ya?ml|[^/]*\.(tf|tfvars|tf\.json|hcl|bicep)|Chart\.ya?ml|values[^/]*\.ya?ml|\.trivyignore(\.yaml)?|trivy\.ya?ml|[^/]*\.(jar|war|ear))$|(^|/)(k8s|kubernetes|manifests|helm|charts|deploy|cloudformation|templates)/'
           npm=true; trivy=true
+          # The payload can be stale: on a push followed by `gh pr ready` within seconds a run's payload still says draft
+          # (T-5808). Only the API's `true` skips, so a failed read, or a caller token with no pull-requests: read, scans.
+          draft=false
+          if [ "$SKIP_DRAFT" = true ] && [ "$DRAFT" = true ]; then
+            live=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" --jq .draft 2>/dev/null || true)
+            if [ "$live" = true ]; then draft=true; fi
+            echo "kf-security-draft payload=true live=${live:-unreadable}"
+          fi
           case "$EVENT" in
             pull_request|pull_request_target)
-              if [ "$SKIP_DRAFT" = true ] && [ "$DRAFT" = true ]; then
+              if [ "$draft" = true ]; then
                 npm=false; trivy=false
                 why="a draft pull request: the dependency scanners run when it is marked ready"
               elif [ "$PR_SCOPE" != true ]; then
@@ -370,6 +383,7 @@ jobs:
               fi ;;
             *) why="a ${EVENT} run scans in full" ;;
           esac
+          echo "draft=${draft}" >> "$GITHUB_OUTPUT"
           echo "npm_audit=${npm}" >> "$GITHUB_OUTPUT"
           echo "trivy=${trivy}" >> "$GITHUB_OUTPUT"
           # one stable line per run, so the skip rate can be counted from the logs (G-218 CI CPU)
@@ -388,7 +402,7 @@ jobs:
     runs-on: ${{ (inputs.main_runner != '' && inputs.runner == 'coolify-ci' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) && inputs.main_runner || inputs.runner }}
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
       # 2026-07-28: not every consuming repo uses pnpm (e.g. liveagent-ai is
@@ -463,7 +477,7 @@ jobs:
             echo "npm_config_ignore_pnpmfile=true"
           } >> "$GITHUB_ENV"
           echo "pnpm_version=$PNPM_PIN" >> "$GITHUB_OUTPUT"
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
         if: steps.pkgmgr.outputs.manager == 'pnpm'
         with:
           version: ${{ steps.npmcfg.outputs.pnpm_version }}
@@ -471,7 +485,7 @@ jobs:
           package_json_file: .npm-audit-pnpm/package.json
       # No `cache: pnpm` here: the audit doesn't need a warm store and the cache
       # Post-step has been flaky (fails the job after an otherwise-green audit).
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with: { node-version: "22" }
       - name: Audit (findings are advisory; an audit that did not run fails)
         shell: bash
@@ -546,7 +560,7 @@ jobs:
       TRIVY_SHA256_ARM64: "e174dff2a6dba5e3ae41f8d0537a6324405bd08132497340304c6b20e0f16a1f"
       TRIVY_BLOCKING: ${{ inputs.trivy_blocking }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
       - name: trivy fs (vuln, secret, misconfig — HIGH/CRITICAL)
@@ -678,7 +692,7 @@ jobs:
         if: ${{ always() }}
         # a full artifact quota must never fail the job (G-218); the scan or test verdict is decided by its own step
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: trivy-report
           path: ${{ runner.temp }}/trivy-report/
@@ -709,7 +723,9 @@ jobs:
     # the job still concludes `success`, unlike job-level continue-on-error.
     # `allow_issue_writing: false`: callers grant no `issues: write`, and findings belong in the
     # run artifact, not auto-filed issues.
-    if: ${{ inputs.preview_url != '' && !(inputs.skip_heavy_on_draft && github.event.pull_request.draft) }}
+    # Anything but a live 'true' scans, like the scope step (T-5808).
+    needs: gitleaks
+    if: ${{ !cancelled() && inputs.preview_url != '' && needs.gitleaks.outputs.draft != 'true' }}
     runs-on: ${{ (inputs.main_runner != '' && inputs.runner == 'coolify-ci' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) && inputs.main_runner || inputs.runner }}
     timeout-minutes: 15
     permissions:
@@ -718,7 +734,7 @@ jobs:
       - name: ZAP baseline scan
         id: zap
         continue-on-error: true
-        uses: zaproxy/action-baseline@v0.15.0
+        uses: zaproxy/action-baseline@de8ad967d3548d44ef623df22cf95c3b0baf8b25 # v0.15.0
         with:
           target: ${{ inputs.preview_url }}
           cmd_options: "-z '-silent'"
@@ -746,7 +762,9 @@ jobs:
   codeql:
     # Default: the caller's weekly schedule and manual dispatch only (see `codeql-every-push`). A skipped job
     # never fails the call, so callers' `security` gates are unchanged.
-    if: ${{ !inputs.skip-codeql && (inputs.codeql-every-push || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && !(inputs.skip_heavy_on_draft && github.event.pull_request.draft) }}
+    # Anything but a live 'true' scans, like the scope step (T-5808).
+    needs: gitleaks
+    if: ${{ !cancelled() && !inputs.skip-codeql && (inputs.codeql-every-push || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && needs.gitleaks.outputs.draft != 'true' }}
     runs-on: ${{ (inputs.main_runner != '' && inputs.runner == 'coolify-ci' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) && inputs.main_runner || inputs.runner }}
     timeout-minutes: 15
     permissions:
@@ -754,15 +772,15 @@ jobs:
       contents: read
       actions: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: github/codeql-action/init@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: github/codeql-action/init@4bfa242aa49c5f7c6770b98670d354a7dfac05f8 # v3.39.1
         with:
           languages: ${{ inputs.language }}
       # SARIF upload requires "Code Security" (code scanning) enabled on the repo.
       # When it's off, analyze runs fine but the upload errors with a configuration
       # error. continue-on-error keeps the gate green; findings still upload once the
       # repo setting is enabled. Flip this to a hard failure org-wide after enabling.
-      - uses: github/codeql-action/analyze@v3
+      - uses: github/codeql-action/analyze@4bfa242aa49c5f7c6770b98670d354a7dfac05f8 # v3.39.1
         continue-on-error: true
         with:
           category: "/language:${{ inputs.language }}"
