@@ -86,6 +86,8 @@ on:
           On a DRAFT pull request, skip the heavy jobs (they report "skipped"); they run when the PR is marked ready.
           Turn it on ONLY in the same change that adds `ready_for_review` to the caller's `pull_request` types: without
           that trigger, marking a PR ready starts no new run and the draft's skipped checks would be its latest.
+          The caller's token also needs pull-requests: read for the skip: the scope step reads the PR, because the
+          payload can be stale (T-5808), and without that read the scanners simply run on a draft.
           Why (G-218 CI stall, 2026-10-27): 117 of 217 queued beast-infra PR runs were on drafts while ready PRs waited
           50+ minutes for a runner.
       pr_scope:
@@ -116,6 +118,7 @@ jobs:
     outputs:
       npm_audit: ${{ steps.scope.outputs.npm_audit }}
       trivy: ${{ steps.scope.outputs.trivy }}
+      draft: ${{ steps.scope.outputs.draft }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { fetch-depth: 0 }
@@ -340,6 +343,8 @@ jobs:
           PR_SCOPE: ${{ inputs.pr_scope }}
           DRAFT: ${{ github.event.pull_request.draft }}
           SKIP_DRAFT: ${{ inputs.skip_heavy_on_draft }}
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
           TRIVY_BLOCKING: ${{ inputs.trivy_blocking }}
         run: |
           # What npm-audit reads: the package manifest, the lockfiles and the registry config.
@@ -351,9 +356,17 @@ jobs:
           # commits, and the push to the default branch runs trivy over the whole tree.)
           TRIVY_RE='(^|/)(package\.json|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|requirements[^/]*\.(txt|in)|constraints[^/]*\.txt|Pipfile(\.lock)?|poetry\.lock|pyproject\.toml|uv\.lock|pdm\.lock|setup\.(py|cfg)|go\.(mod|sum|work)|Cargo\.(toml|lock)|Gemfile(\.lock)?|[^/]*\.gemspec|composer\.(json|lock)|pom\.xml|build\.gradle(\.kts)?|gradle\.lockfile|[^/]*\.(csproj|vbproj|fsproj|sln)|packages\.(config|lock\.json)|Directory\.Packages\.props|mix\.lock|pubspec\.lock|Package\.resolved|Podfile\.lock|conan\.lock|[^/]*Dockerfile[^/]*|[^/]*\.dockerfile|Containerfile[^/]*|[^/]*compose[^/]*\.ya?ml|[^/]*\.(tf|tfvars|tf\.json|hcl|bicep)|Chart\.ya?ml|values[^/]*\.ya?ml|\.trivyignore(\.yaml)?|trivy\.ya?ml|[^/]*\.(jar|war|ear))$|(^|/)(k8s|kubernetes|manifests|helm|charts|deploy|cloudformation|templates)/'
           npm=true; trivy=true
+          # The payload can be stale: on a push followed by `gh pr ready` within seconds a run's payload still says draft
+          # (T-5808). Only the API's `true` skips, so a failed read, or a caller token with no pull-requests: read, scans.
+          draft=false
+          if [ "$SKIP_DRAFT" = true ] && [ "$DRAFT" = true ]; then
+            live=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" --jq .draft 2>/dev/null || true)
+            if [ "$live" = true ]; then draft=true; fi
+            echo "kf-security-draft payload=true live=${live:-unreadable}"
+          fi
           case "$EVENT" in
             pull_request|pull_request_target)
-              if [ "$SKIP_DRAFT" = true ] && [ "$DRAFT" = true ]; then
+              if [ "$draft" = true ]; then
                 npm=false; trivy=false
                 why="a draft pull request: the dependency scanners run when it is marked ready"
               elif [ "$PR_SCOPE" != true ]; then
@@ -370,6 +383,7 @@ jobs:
               fi ;;
             *) why="a ${EVENT} run scans in full" ;;
           esac
+          echo "draft=${draft}" >> "$GITHUB_OUTPUT"
           echo "npm_audit=${npm}" >> "$GITHUB_OUTPUT"
           echo "trivy=${trivy}" >> "$GITHUB_OUTPUT"
           # one stable line per run, so the skip rate can be counted from the logs (G-218 CI CPU)
@@ -709,7 +723,9 @@ jobs:
     # the job still concludes `success`, unlike job-level continue-on-error.
     # `allow_issue_writing: false`: callers grant no `issues: write`, and findings belong in the
     # run artifact, not auto-filed issues.
-    if: ${{ inputs.preview_url != '' && !(inputs.skip_heavy_on_draft && github.event.pull_request.draft) }}
+    # Anything but a live 'true' scans, like the scope step (T-5808).
+    needs: gitleaks
+    if: ${{ !cancelled() && inputs.preview_url != '' && needs.gitleaks.outputs.draft != 'true' }}
     runs-on: ${{ (inputs.main_runner != '' && inputs.runner == 'coolify-ci' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) && inputs.main_runner || inputs.runner }}
     timeout-minutes: 15
     permissions:
