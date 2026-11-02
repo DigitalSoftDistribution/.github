@@ -180,6 +180,8 @@ jobs:
                 RANGE="-1 ${PUSH_AFTER}"
               fi ;;
             merge_group)
+              # The allowlist below is read from PR_BASE: for a merge group that is its base_sha, never the group's own tree.
+              PR_BASE="$MG_BASE"
               # Merge queue entry (workflow_call: github.event is the CALLER's merge_group payload). base_sha is the
               # parent the queue built on (the base branch tip, or the previous entry), head_sha the group commit
               # (= github.sha): base..head is exactly the commits this entry adds. The group branch is a branch
@@ -191,7 +193,7 @@ jobs:
               fi ;;
           esac
           args=(detect --source . --redact --no-banner --exit-code 0 --report-format sarif --report-path gitleaks.sarif)
-          IS_PR=0; case "$EVENT" in pull_request|pull_request_target) IS_PR=1 ;; esac
+          IS_PR=0; case "$EVENT" in pull_request|pull_request_target|merge_group) IS_PR=1 ;; esac
           # The allowlist of a pull request comes from its BASE, never its head: a PR that adds a secret could otherwise
           # allowlist it in the same commit (.gitleaks.toml / .gitleaksignore are read from the checked-out tree).
           # The head's copies are moved aside for the scan; the base's are passed explicitly when it has them.
@@ -261,10 +263,14 @@ jobs:
           EVENT: ${{ github.event_name }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          MG_BASE: ${{ github.event.merge_group.base_sha }}
         run: |
           base=""
           if [ "$EVENT" = pull_request ] || [ "$EVENT" = pull_request_target ]; then
             if git cat-file -e "${PR_BASE}^{commit}" 2>/dev/null; then base="$PR_BASE"; fi
+          elif [ "$EVENT" = merge_group ]; then
+            # same rule as a pull request: only a literal the group ADDS over its base fails
+            if [ -n "$MG_BASE" ] && git cat-file -e "${MG_BASE}^{commit}" 2>/dev/null; then base="$MG_BASE"; fi
           fi
           BASE_SHA="$base" python3 - <<'PY'
           import hashlib, json, os, re, subprocess, sys, urllib.parse
