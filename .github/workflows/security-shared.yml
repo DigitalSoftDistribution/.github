@@ -138,6 +138,8 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PUSH_BEFORE: ${{ github.event.before }}
           PUSH_AFTER: ${{ github.sha }}
+          MG_BASE: ${{ github.event.merge_group.base_sha }}
+          MG_HEAD: ${{ github.event.merge_group.head_sha }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           GITLEAKS_BLOCKING: ${{ inputs.gitleaks_blocking }}
           REPO: ${{ github.repository }}
@@ -177,9 +179,21 @@ jobs:
                 # missing): scan at least the pushed head commit, never an empty range.
                 RANGE="-1 ${PUSH_AFTER}"
               fi ;;
+            merge_group)
+              # The allowlist below is read from PR_BASE: for a merge group that is its base_sha, never the group's own tree.
+              PR_BASE="$MG_BASE"
+              # Merge queue entry (workflow_call: github.event is the CALLER's merge_group payload). base_sha is the
+              # parent the queue built on (the base branch tip, or the previous entry), head_sha the group commit
+              # (= github.sha): base..head is exactly the commits this entry adds. The group branch is a branch
+              # (gh-readonly-queue/...), so the full-depth checkout holds both ends.
+              if [ -n "$MG_BASE" ] && [ -n "$MG_HEAD" ] && have "$MG_BASE" && have "$MG_HEAD"; then
+                RANGE="${MG_BASE}..${MG_HEAD}"
+              else
+                echo "::warning::gitleaks: merge group range ${MG_BASE:0:12}..${MG_HEAD:0:12} not available in this clone; scanning the full history"
+              fi ;;
           esac
           args=(detect --source . --redact --no-banner --exit-code 0 --report-format sarif --report-path gitleaks.sarif)
-          IS_PR=0; case "$EVENT" in pull_request|pull_request_target) IS_PR=1 ;; esac
+          IS_PR=0; case "$EVENT" in pull_request|pull_request_target|merge_group) IS_PR=1 ;; esac
           # The allowlist of a pull request comes from its BASE, never its head: a PR that adds a secret could otherwise
           # allowlist it in the same commit (.gitleaks.toml / .gitleaksignore are read from the checked-out tree).
           # The head's copies are moved aside for the scan; the base's are passed explicitly when it has them.
@@ -249,10 +263,14 @@ jobs:
           EVENT: ${{ github.event_name }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          MG_BASE: ${{ github.event.merge_group.base_sha }}
         run: |
           base=""
           if [ "$EVENT" = pull_request ] || [ "$EVENT" = pull_request_target ]; then
             if git cat-file -e "${PR_BASE}^{commit}" 2>/dev/null; then base="$PR_BASE"; fi
+          elif [ "$EVENT" = merge_group ]; then
+            # same rule as a pull request: only a literal the group ADDS over its base fails
+            if [ -n "$MG_BASE" ] && git cat-file -e "${MG_BASE}^{commit}" 2>/dev/null; then base="$MG_BASE"; fi
           fi
           BASE_SHA="$base" python3 - <<'PY'
           import hashlib, json, os, re, subprocess, sys, urllib.parse
@@ -337,6 +355,8 @@ jobs:
           EVENT: ${{ github.event_name }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          MG_BASE: ${{ github.event.merge_group.base_sha }}
+          MG_HEAD: ${{ github.event.merge_group.head_sha }}
           PR_SCOPE: ${{ inputs.pr_scope }}
           DRAFT: ${{ github.event.pull_request.draft }}
           SKIP_DRAFT: ${{ inputs.skip_heavy_on_draft }}
@@ -367,6 +387,21 @@ jobs:
                 grep -qE "$NPM_RE" <<<"$files" || npm=false
                 if [ "$TRIVY_BLOCKING" != true ] && ! grep -qE "$TRIVY_RE" <<<"$files"; then trivy=false; fi
                 why="the pull request changes ${n} file(s)"
+              fi ;;
+            merge_group)
+              # A merge queue entry is scoped like the pull request it carries: what base_sha..head_sha adds. Every path
+              # that cannot decide leaves both scanners on (npm=true trivy=true).
+              if [ "$PR_SCOPE" != true ]; then
+                why="pr_scope is off"
+              elif [ -z "$MG_BASE" ] || [ -z "$MG_HEAD" ] || ! git cat-file -e "${MG_BASE}^{commit}" 2>/dev/null || ! git cat-file -e "${MG_HEAD}^{commit}" 2>/dev/null; then
+                why="the merge group range ${MG_BASE:0:12}...${MG_HEAD:0:12} is not in this clone"
+              elif ! files=$(git diff --name-only "${MG_BASE}...${MG_HEAD}"); then
+                why="git diff ${MG_BASE:0:12}...${MG_HEAD:0:12} failed"
+              else
+                n=$(printf '%s' "$files" | grep -c . || true)
+                grep -qE "$NPM_RE" <<<"$files" || npm=false
+                if [ "$TRIVY_BLOCKING" != true ] && ! grep -qE "$TRIVY_RE" <<<"$files"; then trivy=false; fi
+                why="the merge group changes ${n} file(s)"
               fi ;;
             *) why="a ${EVENT} run scans in full" ;;
           esac
