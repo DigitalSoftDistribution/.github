@@ -110,7 +110,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ inputs.node-version }}
-          cache: ${{ inputs.package-manager }}
+          # No actions/cache on the self-hosted pool (G-218 BUILD-CACHE-8C, 2026-11-03). Every coolify-ci runner index keeps a
+          # warm pnpm store / npm cache on local disk (beast-infra docs/beast/CI-RUNNERS.md "Warm caches"), so `cache:` only
+          # restored a tarball over a store that was already warm and, after the job, its post step tarred and gzipped the
+          # WHOLE index cache: 386 s of a 1301 s tracklayer job here, ending in "Unable to reserve cache ... another job may be
+          # creating this cache" when another job had saved the key first. A runner outside the pool (runner: ubuntu-latest)
+          # has no warm local cache and keeps it. `&&` / `||` returns the operand, so this is the package manager or "".
+          cache: ${{ (!startsWith(inputs.runner, 'coolify-ci') && inputs.package-manager) || '' }}
 
       - name: Install deps
         shell: bash
