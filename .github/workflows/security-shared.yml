@@ -313,6 +313,18 @@ jobs:
           fi
           echo "gitleaks: $COUNT potential finding(s)"
           if [ "$COUNT" -gt 0 ]; then
+            # Where, never what: rule, file, line and commit (first 12) of each finding, so a reader of this run does not
+            # have to re-scan locally. Only those four fields are read from the SARIF. The secret, the matched text, the
+            # snippet, the message and the commit message are never printed. Control characters in a path become "?", so a
+            # crafted file name cannot start a workflow command. At most 50 lines; the count above says how many there are.
+            jq -r '.runs[]?.results[]?
+                   | "gitleaks finding: rule=\(.ruleId // "?" | tostring | gsub("\\p{Cc}"; "?"))"
+                     + " file=\(.locations[0].physicalLocation.artifactLocation.uri // "?" | tostring | gsub("\\p{Cc}"; "?"))"
+                     + " line=\(.locations[0].physicalLocation.region.startLine // "?" | tostring | gsub("\\p{Cc}"; "?"))"
+                     + " commit=\((.partialFingerprints.commitSha // "" | tostring)[0:12] | gsub("[^0-9a-f]"; "?"))"' \
+              gitleaks.sarif 2>/dev/null | head -n 50 || true
+          fi
+          if [ "$COUNT" -gt 0 ]; then
             if [ "$IS_PR" = 1 ] && [ -n "$RANGE" ] && [ "$MODE" = blocking ]; then
               echo "::error::gitleaks: this pull request's commits add $COUNT secret(s) not covered by the allowlist -- remove them (and rotate any that were real), or allowlist a false positive in .gitleaks.toml / .gitleaksignore"
               exit 1
