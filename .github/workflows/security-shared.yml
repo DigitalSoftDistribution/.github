@@ -128,6 +128,63 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+      # The free binary is pinned by version AND sha256 and installed in its own step, so the job token
+      # (used only for the API fallback below) never reaches the scan step. Order: (1) the copy baked into the
+      # runner image (beast-infra ci/Dockerfile puts this exact version under /opt/gitleaks/<version>/), no
+      # network; (2) the release page, downloaded to a file with retries; (3) the same asset through the REST
+      # API. github.com's release-download endpoint answered 504 for stretches on 2026-11-08 from every runner
+      # family and from the beast host itself, while the API served identical bytes. The sha256 is checked
+      # before anything is extracted; a scan with no verified binary stops here with one clear line.
+      - name: gitleaks (install pinned binary)
+        if: ${{ env.GITLEAKS_LICENSE == '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=8.21.2
+          # sha256 of gitleaks_${VERSION}_linux_x64.tar.gz, from the release's gitleaks_${VERSION}_checksums.txt.
+          # Bump both lines together; a mismatch is refused, never installed.
+          SHA256=5bc41815076e6ed6ef8fbecc9d9b75bcae31f39029ceb55da08086315316e3ba
+          ASSET="gitleaks_${VERSION}_linux_x64.tar.gz"
+          BAKED="/opt/gitleaks/${VERSION}/gitleaks"
+          if [ -x "$BAKED" ] && [ "$("$BAKED" version 2>/dev/null)" = "$VERSION" ]; then
+            cp "$BAKED" /tmp/gitleaks
+            echo "gitleaks ${VERSION}: using the copy baked into the runner image"
+            exit 0
+          fi
+          TGZ="${RUNNER_TEMP:-/tmp}/${ASSET}"
+          CURL=(curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 --max-time 120)
+          fetch_release() {
+            "${CURL[@]}" -o "$TGZ" "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/${ASSET}"
+          }
+          # The token goes to curl on stdin (-K -), never on its command line.
+          fetch_api() {
+            local id
+            [ -n "${GH_TOKEN:-}" ] || return 1
+            id=$(printf 'header = "Authorization: Bearer %s"\n' "$GH_TOKEN" \
+                  | "${CURL[@]}" -K - -H "Accept: application/vnd.github+json" \
+                      "https://api.github.com/repos/gitleaks/gitleaks/releases/tags/v${VERSION}" \
+                  | jq -r --arg n "$ASSET" '.assets[] | select(.name == $n) | .id') || return 1
+            [ -n "$id" ] || return 1
+            printf 'header = "Authorization: Bearer %s"\n' "$GH_TOKEN" \
+              | "${CURL[@]}" -K - -H "Accept: application/octet-stream" -o "$TGZ" \
+                  "https://api.github.com/repos/gitleaks/gitleaks/releases/assets/${id}"
+          }
+          SRC="release page"
+          if ! fetch_release; then
+            echo "gitleaks: release download failed, trying the REST API asset"
+            fetch_api || { echo "::error::gitleaks download failed after retries; no scan ran"; exit 1; }
+            SRC="REST API"
+          fi
+          unset GH_TOKEN
+          GOT=$(sha256sum "$TGZ" | cut -d' ' -f1)
+          if [ "$GOT" != "$SHA256" ]; then
+            rm -f "$TGZ"
+            echo "::error::gitleaks sha256 mismatch for ${ASSET} (expected ${SHA256:0:12}, got ${GOT:0:12}); refusing to extract; no scan ran"
+            exit 1
+          fi
+          tar -xzf "$TGZ" -C /tmp gitleaks
+          echo "gitleaks ${VERSION}: installed from the ${SRC}, sha256 verified"
       - name: gitleaks (free binary fallback)
         if: ${{ env.GITLEAKS_LICENSE == '' }}
         shell: bash
@@ -144,9 +201,7 @@ jobs:
           GITLEAKS_BLOCKING: ${{ inputs.gitleaks_blocking }}
           REPO: ${{ github.repository }}
         run: |
-          VERSION=8.21.2
-          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz" \
-            | tar -xz -C /tmp gitleaks
+          # The pinned, sha256-verified binary was installed at /tmp/gitleaks by the step above.
           # Scope (2026-09-27): a pull request scans exactly its own commits (base..head) and a push the
           # pushed range; only the scheduled / manual run scans the whole history. Scanning the full
           # history on every PR timed out at 5 min on kluczesoft-pl and turned this advisory check red.
@@ -607,7 +662,7 @@ jobs:
             esac
             TARBALL="trivy_${TRIVY_VERSION}_${ASSET}.tar.gz"
             if [ -n "$ASSET" ] \
-              && curl -fsSL --retry 3 --retry-delay 2 -o "$RUNNER_TEMP/$TARBALL" \
+              && curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 --max-time 120 -o "$RUNNER_TEMP/$TARBALL" \
                    "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${TARBALL}" \
               && echo "${SHA}  $RUNNER_TEMP/$TARBALL" | sha256sum -c - >/dev/null \
               && tar -xzf "$RUNNER_TEMP/$TARBALL" -C "$RUNNER_TEMP" trivy; then
