@@ -657,7 +657,9 @@ jobs:
     # Skipped (a passing check) only when the scope step said 'false', which it never does with trivy_blocking: true.
     if: ${{ !cancelled() && needs.gitleaks.outputs.trivy != 'false' }}
     runs-on: ${{ (inputs.main_runner != '' && inputs.runner == 'coolify-ci' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) && inputs.main_runner || inputs.runner }}
-    timeout-minutes: 10
+    # 12 min = the install's 92 s worst case (its budget is in the scan step) + the scan's own `--timeout 8m` + checkout, SARIF
+    # conversion, summary and report upload, with slack. 10 min left 28 s for all of it after a slow install.
+    timeout-minutes: 12
     # Least privilege: the scan reads the checkout only (artifact upload uses the runtime token).
     permissions:
       contents: read
@@ -684,6 +686,13 @@ jobs:
 
           # Reuse a runner-provided trivy when present; otherwise install the pinned release
           # into RUNNER_TEMP with its checksum verified.
+          #
+          # The download has a hard time budget. github.com's release endpoint answered 503/504 for stretches on 2026-11-08
+          # and can also HANG; the old `--retry 5 --max-time 120` with no total cap took up to 6 x 120 s + 5 x 5 s = 745 s,
+          # past this job's old 10-minute limit, so the advisory job ended cancelled instead of with the warning below.
+          # `timeout` bounds the whole curl call including curl's own retries (up to 3 tries of 30 s, 2 s apart): 90 s, plus
+          # at most 2 s of kill grace = 92 s. The asset is 52.7 MB (x64) / 47.4 MB (arm64), so 30 s a try needs about
+          # 14 Mbit/s. The job timeout below covers this, the scan's own 8-minute --timeout, checkout and reporting.
           TRIVY="$(command -v trivy || true)"
           if [ -z "$TRIVY" ]; then
             case "$(uname -m)" in
@@ -692,15 +701,24 @@ jobs:
               *)             ASSET=""; SHA="" ;;
             esac
             TARBALL="trivy_${TRIVY_VERSION}_${ASSET}.tar.gz"
-            if [ -n "$ASSET" ] \
-              && curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 --max-time 120 -o "$RUNNER_TEMP/$TARBALL" \
-                   "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${TARBALL}" \
-              && echo "${SHA}  $RUNNER_TEMP/$TARBALL" | sha256sum -c - >/dev/null \
-              && tar -xzf "$RUNNER_TEMP/$TARBALL" -C "$RUNNER_TEMP" trivy; then
-              TRIVY="$RUNNER_TEMP/trivy"
-            else
+            if [ -z "$ASSET" ]; then
               STATUS=error
-              ERR="could not install trivy ${TRIVY_VERSION} for $(uname -m)"
+              ERR="could not install trivy ${TRIVY_VERSION} for $(uname -m): no pinned build for this architecture"
+            elif ! timeout -k 2 90 curl -fsSL --retry 2 --retry-all-errors --retry-delay 2 --connect-timeout 10 --max-time 30 \
+                   -o "$RUNNER_TEMP/$TARBALL" \
+                   "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${TARBALL}"; then
+              rm -f "$RUNNER_TEMP/$TARBALL"
+              STATUS=error
+              ERR="could not install trivy ${TRIVY_VERSION} for $(uname -m): download failed or used up its 90 s budget"
+            elif ! echo "${SHA}  $RUNNER_TEMP/$TARBALL" | sha256sum -c - >/dev/null; then
+              rm -f "$RUNNER_TEMP/$TARBALL"
+              STATUS=error
+              ERR="could not install trivy ${TRIVY_VERSION} for $(uname -m): sha256 mismatch, not extracted"
+            elif ! tar -xzf "$RUNNER_TEMP/$TARBALL" -C "$RUNNER_TEMP" trivy; then
+              STATUS=error
+              ERR="could not install trivy ${TRIVY_VERSION} for $(uname -m): extract failed"
+            else
+              TRIVY="$RUNNER_TEMP/trivy"
             fi
           fi
 
