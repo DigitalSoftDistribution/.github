@@ -1,0 +1,907 @@
+# Reusable security workflow — gitleaks (secrets) + npm audit (deps) + CodeQL (SAST) + trivy
+# (vuln/secret/misconfig) + optional ZAP baseline (DAST against a PR preview).
+# Called by each repo's .github/workflows/security.yml as `uses:`.
+#
+# Design goals:
+#  - Never block merges on infra/licensing gaps we don't control. Secret + SAST
+#    findings should surface as warnings/annotations, not hard CI failures, until
+#    the org enables the corresponding paid/repo-level features.
+#  - gitleaks is REPORT-ONLY until `gitleaks_blocking: true` (T-3698): then a pull request whose own commits
+#    add a secret outside the allowlist fails, and an unscanned PR fails closed. Full-history scans never block.
+#  - trivy (HIGH/CRITICAL) is ADVISORY on first rollout: counts go to the job summary,
+#    the JSON+SARIF report to the `trivy-report` artifact, and the check stays green.
+#    A repo opts into failing with `trivy_blocking: true`. It scans only the repo's own
+#    lockfiles/Dockerfiles/IaC, so a finding is always actionable by that repo.
+#  - ZAP baseline is opt-in (pass `preview_url`) and never blocks.
+#  - On a pull request, npm-audit and trivy run only when the PR changes what they read (`pr_scope`, default true);
+#    gitleaks and the MCP literal scan run on every PR, and push / schedule / dispatch always scan in full.
+name: security-shared
+on:
+  workflow_call:
+    inputs:
+      language:
+        type: string
+        default: "javascript-typescript"
+      runner:
+        description: >
+          runs-on label for every job (default the shared coolify-ci pool). A caller routes a hotfix PR to the hotfix
+          lane with: (contains(github.event.pull_request.labels.*.name, 'hotfix') || startsWith(github.head_ref,
+          'hotfix/')) && 'coolify-ci-hotfix' || 'coolify-ci' (beast-infra docs/beast/CI-RUNNERS.md "Hotfix lane", G-218).
+        type: string
+        default: "coolify-ci"
+      main_runner:
+        type: string
+        default: "coolify-ci-main"
+        description: >
+          runs-on label for a PUSH to the repository's default branch, used only while `runner` is the plain shared
+          pool (`coolify-ci`); a caller that names any other runner keeps it. "" keeps main on `runner`.
+          Why (G-218, 2026-10-27): main's ci + security runs queued 10-26 min for a runner behind ~220 pull-request
+          jobs on the same `coolify-ci` label (kf security 21 min, zephr ci 26 min), and the merge gate holds every
+          green PR of the repo until main's run settles: 92 green PRs waited with 0 merges a round. `coolify-ci-main`
+          is the beast main lane (gha-runner-main@21..28, beast-infra ci/install-lanes.sh): a pull-request job asking
+          for `coolify-ci` reaches only the lane runners lent to the shared pool (/etc/beast-ci/lanes-shared).
+          Schedule / workflow_dispatch / pull_request runs stay on `runner`.
+      skip-codeql:
+        type: boolean
+        default: false
+      codeql-every-push:
+        type: boolean
+        default: false
+        description: >
+          Run CodeQL on every pull request and push too. By default (2026-10-16, G-218) it runs only on
+          the caller's `schedule` and on `workflow_dispatch`. Code Security is not enabled on any org repo,
+          so the per-push SARIF upload fails (continue-on-error below) and the results go nowhere, while
+          each run holds 3.5-6 GB of Java on a shared beast runner for about 4 min. liveagent-ai alone ran
+          75 of them in one day. Four in parallel took beast to load 477 at 06:24Z on 10-15, and CodeQL
+          java was the process the kernel OOM-killed at 07:21Z. Set this true only once Code Security is
+          enabled on the repo AND per-PR alerts are wanted.
+      gitleaks_blocking:
+        type: boolean
+        default: false
+        description: >
+          Fail the gitleaks check when a PULL REQUEST'S OWN commits (base..head) add a secret that the repo's
+          BASE branch's allowlist (.gitleaks.toml / .gitleaksignore -- never the PR's own copy) does not cover, or
+          when that range cannot be scanned. Default
+          false = report-only (G-218 T-3698, 2026-10-24): the count goes to the job summary and a
+          `kf-gitleaks-count` log line, and the check stays green. It becomes the default after one week of counts.
+          Scheduled / manual full-history scans and pushes never fail on findings (old history is triaged, not
+          blocked).
+      trivy_blocking:
+        type: boolean
+        default: false
+        description: >
+          Fail the security check when trivy finds HIGH/CRITICAL vulnerabilities, secrets or
+          misconfigurations (or cannot complete the scan). Default false = advisory: findings are
+          reported in the job summary and the trivy-report artifact but never fail the check.
+      preview_url:
+        type: string
+        default: ""
+        description: >
+          PR preview URL for the ZAP baseline scan (e.g. https://pr-123-lizensa.previews.softblaze.net).
+          Leave empty to skip the zap-baseline job entirely — it does not run without a target.
+      skip_heavy_on_draft:
+        type: boolean
+        default: false
+        description: >
+          On a DRAFT pull request, skip the heavy jobs (they report "skipped"); they run when the PR is marked ready.
+          Turn it on ONLY in the same change that adds `ready_for_review` to the caller's `pull_request` types: without
+          that trigger, marking a PR ready starts no new run and the draft's skipped checks would be its latest.
+          Why (G-218 CI stall, 2026-10-27): 117 of 217 queued beast-infra PR runs were on drafts while ready PRs waited
+          50+ minutes for a runner.
+      pr_scope:
+        type: boolean
+        default: true
+        description: >
+          On a PULL REQUEST, run the two advisory dependency scanners only when the pull request changes what they
+          read: npm-audit when it changes a package manifest, lockfile or .npmrc; trivy when it changes a dependency
+          manifest or lockfile, a container or IaC file, or the trivy config (and ALWAYS when trivy_blocking is true).
+          Otherwise the job reports "skipped", which passes like any skipped check. gitleaks and the MCP literal scan
+          run on every pull request either way; push, schedule and workflow_dispatch run every scanner in full.
+          Why (G-218 CI CPU, 2026-10-27): 2,000 pull-request security runs in 48 h each started two runner containers
+          for a 10-25 s advisory scan whose input the pull request had not touched (over 90 % of them), about 3,700
+          container starts on the shared pool. Set false to scan every pull request.
+
+jobs:
+  gitleaks:
+    runs-on: ${{ (inputs.main_runner != '' && inputs.runner == 'coolify-ci' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) && inputs.main_runner || inputs.runner }}
+    # A pull request / push scans only its own commits and finishes in seconds; the full-history scan
+    # is the scheduled / manual run, which needs longer on large histories (kluczesoft-pl, 41k files).
+    # Pull request / push: 8 min = the 5 min that covered checkout and scan, plus the install step's 121 s worst case
+    # (its caps are summed in that step) and slack, so a hung download cannot starve the scan.
+    timeout-minutes: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 30 || 8 }}
+    # Least privilege: the job reads the checkout, and the install step's REST API fallback reads a public release.
+    permissions:
+      contents: read
+    # Surface the secret into a job-level env var so step `if:` conditions can read
+    # it (GitHub Actions forbids `secrets.*` directly inside `if:`).
+    env:
+      GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+    # Which advisory scanners this run needs (the `scope` step, last in this job). Anything but 'false' runs the scanner,
+    # so a scope step that never ran (cancelled, crashed) fails open: npm-audit and trivy run as before.
+    outputs:
+      npm_audit: ${{ steps.scope.outputs.npm_audit }}
+      trivy: ${{ steps.scope.outputs.trivy }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      # gitleaks-action@v2 requires a paid GITLEAKS_LICENSE for ORG repos. When the
+      # license secret is present, use the action (richer reporting). Otherwise fall
+      # back to the free open-source gitleaks binary so secret scanning still runs.
+      - name: gitleaks (licensed action)
+        if: ${{ env.GITLEAKS_LICENSE != '' }}
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+      # The free binary is pinned by version AND sha256 and installed in its own step, so the job token
+      # (used only for the API fallback below) never reaches the scan step. Order: (1) the copy baked into the
+      # runner image (beast-infra ci/Dockerfile puts this exact version under /opt/gitleaks/<version>/), no
+      # network; (2) the release page, downloaded to a file with retries; (3) the same asset through the REST
+      # API. github.com's release-download endpoint answered 504 for stretches on 2026-11-08 from every runner
+      # family and from the beast host itself, while the API served identical bytes. The sha256 is checked
+      # before anything is extracted; a scan with no verified binary stops here with one clear line.
+      - name: gitleaks (install pinned binary)
+        if: ${{ env.GITLEAKS_LICENSE == '' }}
+        shell: bash
+        # Every network phase has a hard cap, so this step ends inside the job's timeout even when github.com HANGS
+        # instead of answering 504 (2026-11-08: a hung curl held a job to its 5-minute limit and the REST API fallback
+        # never ran). Worst case with no success at all: 45 + 25 + 45 = 115 s of caps, plus at most 3 x 2 s of kill grace
+        # = 121 s. The step timeout is a backstop above that.
+        timeout-minutes: 3
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=8.21.2
+          # sha256 of gitleaks_${VERSION}_linux_x64.tar.gz, from the release's gitleaks_${VERSION}_checksums.txt.
+          # Bump VERSION, SHA256 and BIN_SHA256 together; a mismatch is refused, never installed.
+          SHA256=5bc41815076e6ed6ef8fbecc9d9b75bcae31f39029ceb55da08086315316e3ba
+          # sha256 of the gitleaks binary inside that tarball.
+          BIN_SHA256=50b742abd7daad8bbddb6301f3017efb680632d9a5b3b4d8f137b3aac250e359
+          ASSET="gitleaks_${VERSION}_linux_x64.tar.gz"
+          # A gitleaks already on the runner (baked into the image under /opt/gitleaks/<version>, or on PATH) is used when
+          # its own sha256 equals BIN_SHA256: no download at all.
+          for cand in "/opt/gitleaks/${VERSION}/gitleaks" "$(command -v gitleaks || true)"; do
+            [ -n "$cand" ] && [ -x "$cand" ] || continue
+            if [ "$(sha256sum "$cand" | cut -d' ' -f1)" = "$BIN_SHA256" ]; then
+              [ "$cand" -ef /tmp/gitleaks ] || cp "$cand" /tmp/gitleaks
+              echo "gitleaks ${VERSION}: using ${cand} (sha256 matches the pin), no download"
+              exit 0
+            fi
+          done
+          TGZ="${RUNNER_TEMP:-/tmp}/${ASSET}"
+          # `timeout` bounds a whole curl call including curl's own retries, so the caps are exact sums, not a reading of
+          # curl's retry rules.
+          GET=(curl -fsSL --retry 3 --retry-all-errors --retry-delay 2 --connect-timeout 10)
+          fetch_release() {
+            timeout -k 2 45 "${GET[@]}" --max-time 20 -o "$TGZ" \
+              "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/${ASSET}"
+          }
+          # The token goes to curl on stdin (-K -), never on its command line.
+          fetch_api() {
+            local id
+            [ -n "${GH_TOKEN:-}" ] || return 1
+            id=$(printf 'header = "Authorization: Bearer %s"\n' "$GH_TOKEN" \
+                  | timeout -k 2 25 "${GET[@]}" --max-time 10 -K - -H "Accept: application/vnd.github+json" \
+                      "https://api.github.com/repos/gitleaks/gitleaks/releases/tags/v${VERSION}" \
+                  | jq -r --arg n "$ASSET" '.assets[] | select(.name == $n) | .id') || return 1
+            [ -n "$id" ] || return 1
+            printf 'header = "Authorization: Bearer %s"\n' "$GH_TOKEN" \
+              | timeout -k 2 45 "${GET[@]}" --max-time 20 -K - -H "Accept: application/octet-stream" -o "$TGZ" \
+                  "https://api.github.com/repos/gitleaks/gitleaks/releases/assets/${id}"
+          }
+          SRC="release page"
+          if ! fetch_release; then
+            echo "gitleaks: release download failed, trying the REST API asset"
+            fetch_api || { echo "::error::gitleaks download failed after retries; no scan ran"; exit 1; }
+            SRC="REST API"
+          fi
+          unset GH_TOKEN
+          GOT=$(sha256sum "$TGZ" | cut -d' ' -f1)
+          if [ "$GOT" != "$SHA256" ]; then
+            rm -f "$TGZ"
+            echo "::error::gitleaks sha256 mismatch for ${ASSET} (expected ${SHA256:0:12}, got ${GOT:0:12}); refusing to extract; no scan ran"
+            exit 1
+          fi
+          tar -xzf "$TGZ" --no-same-owner -C /tmp gitleaks
+          echo "gitleaks ${VERSION}: installed from the ${SRC}, sha256 verified"
+      - name: gitleaks (free binary fallback)
+        if: ${{ env.GITLEAKS_LICENSE == '' }}
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+          MG_BASE: ${{ github.event.merge_group.base_sha }}
+          MG_HEAD: ${{ github.event.merge_group.head_sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GITLEAKS_BLOCKING: ${{ inputs.gitleaks_blocking }}
+          REPO: ${{ github.repository }}
+        run: |
+          # The pinned, sha256-verified binary was installed at /tmp/gitleaks by the step above.
+          # Scope (2026-09-27): a pull request scans exactly its own commits (base..head) and a push the
+          # pushed range; only the scheduled / manual run scans the whole history. Scanning the full
+          # history on every PR timed out at 5 min on kluczesoft-pl and turned this advisory check red.
+          # A new-branch push (before = 000…) scans what the default branch does not already have; a
+          # force-push whose `before` is gone falls back to the pushed head commit alone.
+          # A range whose commits are not in this clone would make gitleaks error out behind `|| true` and
+          # silently scan nothing, so every range is checked first; when it cannot be made valid the job
+          # falls back to the full-history scan (slow, but never a silent skip).
+          have() { git cat-file -e "${1}^{commit}" 2>/dev/null; }
+          RANGE=""
+          case "$EVENT" in
+            pull_request|pull_request_target)
+              # pull_request_target checks out the BASE repository: a fork's head commit is not in it.
+              if [ -n "$PR_HEAD" ] && ! have "$PR_HEAD" && [ -n "$PR_NUMBER" ]; then
+                git fetch --no-tags --quiet origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/origin/pr-head" || true
+              fi
+              if [ -n "$PR_BASE" ] && [ -n "$PR_HEAD" ] && have "$PR_BASE" && have "$PR_HEAD"; then
+                RANGE="${PR_BASE}..${PR_HEAD}"
+              else
+                echo "::warning::gitleaks: PR range ${PR_BASE:0:12}..${PR_HEAD:0:12} not available in this clone; scanning the full history"
+              fi ;;
+            push)
+              if [ -n "$PUSH_BEFORE" ] && [ "${PUSH_BEFORE//0/}" != "" ] && have "$PUSH_BEFORE"; then
+                RANGE="${PUSH_BEFORE}..${PUSH_AFTER}"
+              elif [ -n "$DEFAULT_BRANCH" ] && have "origin/${DEFAULT_BRANCH}" \
+                   && [ "$(git rev-list --count "origin/${DEFAULT_BRANCH}..${PUSH_AFTER}" 2>/dev/null || echo 0)" -gt 0 ]; then
+                RANGE="origin/${DEFAULT_BRANCH}..${PUSH_AFTER}"
+              else
+                # before is gone (force-push) and the default branch already equals the pushed head (or is
+                # missing): scan at least the pushed head commit, never an empty range.
+                RANGE="-1 ${PUSH_AFTER}"
+              fi ;;
+            merge_group)
+              # The allowlist below is read from PR_BASE: for a merge group that is its base_sha, never the group's own tree.
+              PR_BASE="$MG_BASE"
+              # Merge queue entry (workflow_call: github.event is the CALLER's merge_group payload). base_sha is the
+              # parent the queue built on (the base branch tip, or the previous entry), head_sha the group commit
+              # (= github.sha): base..head is exactly the commits this entry adds. The group branch is a branch
+              # (gh-readonly-queue/...), so the full-depth checkout holds both ends.
+              if [ -n "$MG_BASE" ] && [ -n "$MG_HEAD" ] && have "$MG_BASE" && have "$MG_HEAD"; then
+                RANGE="${MG_BASE}..${MG_HEAD}"
+              else
+                echo "::warning::gitleaks: merge group range ${MG_BASE:0:12}..${MG_HEAD:0:12} not available in this clone; scanning the full history"
+              fi ;;
+          esac
+          args=(detect --source . --redact --no-banner --exit-code 0 --report-format sarif --report-path gitleaks.sarif)
+          IS_PR=0; case "$EVENT" in pull_request|pull_request_target|merge_group) IS_PR=1 ;; esac
+          # The allowlist of a pull request comes from its BASE, never its head: a PR that adds a secret could otherwise
+          # allowlist it in the same commit (.gitleaks.toml / .gitleaksignore are read from the checked-out tree).
+          # The head's copies are moved aside for the scan; the base's are passed explicitly when it has them.
+          ASIDE="${RUNNER_TEMP:-/tmp}/gitleaks-head-allowlist.$$"
+          if [ "$IS_PR" = 1 ]; then
+            mkdir -p "$ASIDE"
+            for f in .gitleaks.toml .gitleaksignore; do if [ -e "$f" ]; then mv "$f" "$ASIDE/$f"; fi; done
+            if [ -n "$PR_BASE" ] && git show "${PR_BASE}:.gitleaks.toml" > "$ASIDE/base.gitleaks.toml" 2>/dev/null; then
+              args+=(--config "$ASIDE/base.gitleaks.toml")
+            fi
+            if [ -n "$PR_BASE" ] && git show "${PR_BASE}:.gitleaksignore" > "$ASIDE/base.gitleaksignore" 2>/dev/null; then
+              args+=(--gitleaks-ignore-path "$ASIDE/base.gitleaksignore")
+            fi
+          fi
+          if [ -n "$RANGE" ]; then
+            echo "gitleaks: scanning ${EVENT} range ${RANGE}"
+            args+=(--log-opts="$RANGE")
+          else
+            echo "gitleaks: scanning the full history (${EVENT})"
+          fi
+          # --exit-code 0: a finding never makes gitleaks itself fail, so a non-zero exit is an ERROR (bad range, no
+          # binary, unreadable repo) and is told apart from "found something". The decision is made below.
+          rc=0
+          /tmp/gitleaks "${args[@]}" || rc=$?
+          if [ "$IS_PR" = 1 ]; then
+            for f in .gitleaks.toml .gitleaksignore; do if [ -e "$ASIDE/$f" ]; then mv "$ASIDE/$f" "$f"; fi; done
+          fi
+          COUNT=$(jq '[.runs[]?.results[]?] | length' gitleaks.sarif 2>/dev/null || echo "")
+          if [ "$GITLEAKS_BLOCKING" = "true" ]; then MODE=blocking; else MODE=report-only; fi
+          # one stable line per run: the report-only week's per-repo counts are read from these (T-3698)
+          echo "kf-gitleaks-count repo=${REPO} event=${EVENT} pr=${PR_NUMBER:-} range=${RANGE:-full} count=${COUNT:-error} rc=${rc} mode=${MODE}"
+          {
+            echo "### gitleaks"
+            echo "- scope: ${RANGE:-full history} (${EVENT})"
+            echo "- findings: ${COUNT:-could not be read} (values are redacted; the SARIF is in the job log annotations)"
+            echo "- mode: ${MODE}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$rc" -ne 0 ] || [ -z "$COUNT" ]; then
+            msg="gitleaks did not complete (exit ${rc}, report ${COUNT:+read}${COUNT:-missing}): this run proves nothing about secrets"
+            # a pull request in blocking mode fails closed: an unscanned PR is never green
+            if [ "$IS_PR" = 1 ] && [ "$MODE" = blocking ]; then echo "::error::$msg"; exit 1; fi
+            echo "::warning::$msg"; exit 0
+          fi
+          echo "gitleaks: $COUNT potential finding(s)"
+          if [ "$COUNT" -gt 0 ]; then
+            # Where, never what: rule, file, line and commit (first 12) of each finding, so a reader of this run does not
+            # have to re-scan locally. Only those four fields are read from the SARIF. The secret, the matched text, the
+            # snippet, the message and the commit message are never printed. Control characters in a path become "?", so a
+            # crafted file name cannot start a workflow command. At most 50 lines; the count above says how many there are.
+            jq -r '.runs[]?.results[]?
+                   | "gitleaks finding: rule=\(.ruleId // "?" | tostring | gsub("\\p{Cc}"; "?"))"
+                     + " file=\(.locations[0].physicalLocation.artifactLocation.uri // "?" | tostring | gsub("\\p{Cc}"; "?"))"
+                     + " line=\(.locations[0].physicalLocation.region.startLine // "?" | tostring | gsub("\\p{Cc}"; "?"))"
+                     + " commit=\((.partialFingerprints.commitSha // "" | tostring)[0:12] | gsub("[^0-9a-f]"; "?"))"' \
+              gitleaks.sarif 2>/dev/null | head -n 50 || true
+          fi
+          if [ "$COUNT" -gt 0 ]; then
+            if [ "$IS_PR" = 1 ] && [ -n "$RANGE" ] && [ "$MODE" = blocking ]; then
+              echo "::error::gitleaks: this pull request's commits add $COUNT secret(s) not covered by the allowlist -- remove them (and rotate any that were real), or allowlist a false positive in .gitleaks.toml / .gitleaksignore"
+              exit 1
+            fi
+            if [ "$IS_PR" = 1 ] && [ -z "$RANGE" ] && [ "$MODE" = blocking ]; then
+              # the PR's own range could not be scanned (the full history was): fail closed, never guess
+              echo "::error::gitleaks: the pull request range could not be scanned on its own; $COUNT finding(s) in the full history -- rerun, or fix the checkout"
+              exit 1
+            fi
+            echo "::warning::gitleaks flagged $COUNT potential secret(s) (${MODE}) — review the redacted findings"
+          fi
+
+      # MCP client configs (security lane 2026-10-20, G-218): a literal Semrush key and Pipeboard (Meta/Google Ads) tokens sat
+      # in tracked .mcp.json files on main of five repos. gitleaks' generic rules did not flag "Apikey <hex>" or a token in
+      # a URL query. This step parses every tracked MCP client config and names (never prints) each literal credential:
+      # a header value, a secret-named env value, or a token-like URL query parameter that is not an env reference
+      # (${VAR}). A pull request FAILS only for a literal it ADDS (a JSON path whose literal value the base does not already
+      # hold); literals already on the base are warnings, so a repo that still carries an old one is not turned red.
+      - name: mcp config literal secrets
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          MG_BASE: ${{ github.event.merge_group.base_sha }}
+        run: |
+          base=""
+          if [ "$EVENT" = pull_request ] || [ "$EVENT" = pull_request_target ]; then
+            if git cat-file -e "${PR_BASE}^{commit}" 2>/dev/null; then base="$PR_BASE"; fi
+          elif [ "$EVENT" = merge_group ]; then
+            # same rule as a pull request: only a literal the group ADDS over its base fails
+            if [ -n "$MG_BASE" ] && git cat-file -e "${MG_BASE}^{commit}" 2>/dev/null; then base="$MG_BASE"; fi
+          fi
+          BASE_SHA="$base" python3 - <<'PY'
+          import hashlib, json, os, re, subprocess, sys, urllib.parse
+          NAMES = re.compile(r"(^|/)(\.?mcp\.json|dotmcp\.json|cline_mcp_settings\.json|claude_desktop_config\.json|mcp_settings\.json)$")
+          SECRET_KEY = re.compile(r"(key|token|secret|password|passwd|credential|auth|bearer|cookie|dsn)", re.I)
+          QUERY_KEY = re.compile(r"^(token|key|api_?key|apikey|access_?token|secret|auth|signature|sig|password)$", re.I)
+          HINT = ("replace the value with an env reference -- \"Authorization\": \"Bearer $"
+                  "{MY_TOKEN}\" or \"?token=$" "{MY_TOKEN}\" -- put the value in Infisical, and have each developer export "
+                  "MY_TOKEN before starting the client (see the repo README or the PR that moved the others)")
+          def literal(v):
+              s = str(v).strip()
+              if not s:
+                  return None
+              stripped = re.sub(r"\$\{[^}]+\}", "", s)
+              word = stripped.split(" ", 1)[1] if " " in stripped else stripped   # "Apikey ${X}" / "Bearer ${X}" -> ""
+              word = word.strip()
+              return hashlib.sha256(word.encode()).hexdigest() if len(word) >= 8 else None
+          def scan(obj, path, hits):
+              if isinstance(obj, dict):
+                  for k, v in obj.items():
+                      p = f"{path}.{k}" if path else str(k)
+                      parent = path.rsplit(".", 1)[-1] if path else ""
+                      if isinstance(v, str):
+                          if parent in ("headers", "env") and (parent == "headers" or SECRET_KEY.search(k)):
+                              h = literal(v)
+                              if h:
+                                  hits[p] = h
+                          elif re.match(r"^[a-z][a-z0-9+.-]*://", v, re.I):
+                              u = urllib.parse.urlsplit(v)
+                              if u.password:
+                                  hits[p + " (password in URL)"] = hashlib.sha256(u.password.encode()).hexdigest()
+                              for qk, qv in urllib.parse.parse_qsl(u.query, keep_blank_values=False):
+                                  h = literal(qv) if QUERY_KEY.match(qk) else None
+                                  if h:
+                                      hits[f"{p} (query {qk})"] = h
+                      else:
+                          scan(v, p, hits)
+              elif isinstance(obj, list):
+                  for i, v in enumerate(obj):
+                      scan(v, f"{path}[{i}]", hits)
+          def hits_of(text):
+              try:
+                  data = json.loads(text)
+              except ValueError:
+                  return None
+              out = {}
+              scan(data, "", out)
+              return out
+          base = os.environ.get("BASE_SHA", "")
+          files = [f for f in subprocess.run(["git", "ls-files"], capture_output=True, text=True).stdout.splitlines() if NAMES.search(f)]
+          fail = 0
+          for f in files:
+              try:
+                  head = hits_of(open(f, encoding="utf-8").read())
+              except OSError:
+                  continue
+              if not head:
+                  continue
+              before = {}
+              if base:
+                  r = subprocess.run(["git", "show", f"{base}:{f}"], capture_output=True, text=True)
+                  before = (hits_of(r.stdout) or {}) if r.returncode == 0 else {}
+              old_values = set(before.values())
+              for path, h in sorted(head.items()):
+                  if base and before.get(path) != h and h not in old_values:
+                      print(f"::error file={f}::this PR adds a literal credential at {path} -- {HINT}")
+                      fail += 1
+                  else:
+                      print(f"::warning file={f}::literal credential at {path} (already on the base) -- {HINT}")
+          print(f"mcp config scan: {len(files)} file(s), {fail} added literal credential(s)")
+          sys.exit(1 if fail else 0)
+          PY
+
+      # pr_scope (see the input): decide here, in a job that already has the full history checked out, so the two
+      # scanners a pull request does not need never start a runner container at all. `!cancelled()`: it also runs when a
+      # step above failed, so a red gitleaks never skips the dependency scans. Every path that cannot decide says 'true'.
+      - name: scope (which advisory scanners this run needs)
+        id: scope
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          MG_BASE: ${{ github.event.merge_group.base_sha }}
+          MG_HEAD: ${{ github.event.merge_group.head_sha }}
+          PR_SCOPE: ${{ inputs.pr_scope }}
+          DRAFT: ${{ github.event.pull_request.draft }}
+          SKIP_DRAFT: ${{ inputs.skip_heavy_on_draft }}
+          TRIVY_BLOCKING: ${{ inputs.trivy_blocking }}
+        run: |
+          # What npm-audit reads: the package manifest, the lockfiles and the registry config.
+          NPM_RE='(^|/)(package\.json|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|yarn\.lock|\.npmrc)$'
+          # What `trivy fs --scanners vuln,secret,misconfig` reads for vulnerabilities and misconfigurations: dependency
+          # manifests and lockfiles of every ecosystem trivy supports, Dockerfiles / Containerfiles / compose files,
+          # Terraform / HCL / Bicep, Helm and Kubernetes trees, CloudFormation, bundled archives, and trivy's own config.
+          # (Its secret scanner reads every file: on a pull request gitleaks + the MCP literal scan cover the PR's own
+          # commits, and the push to the default branch runs trivy over the whole tree.)
+          TRIVY_RE='(^|/)(package\.json|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|requirements[^/]*\.(txt|in)|constraints[^/]*\.txt|Pipfile(\.lock)?|poetry\.lock|pyproject\.toml|uv\.lock|pdm\.lock|setup\.(py|cfg)|go\.(mod|sum|work)|Cargo\.(toml|lock)|Gemfile(\.lock)?|[^/]*\.gemspec|composer\.(json|lock)|pom\.xml|build\.gradle(\.kts)?|gradle\.lockfile|[^/]*\.(csproj|vbproj|fsproj|sln)|packages\.(config|lock\.json)|Directory\.Packages\.props|mix\.lock|pubspec\.lock|Package\.resolved|Podfile\.lock|conan\.lock|[^/]*Dockerfile[^/]*|[^/]*\.dockerfile|Containerfile[^/]*|[^/]*compose[^/]*\.ya?ml|[^/]*\.(tf|tfvars|tf\.json|hcl|bicep)|Chart\.ya?ml|values[^/]*\.ya?ml|\.trivyignore(\.yaml)?|trivy\.ya?ml|[^/]*\.(jar|war|ear))$|(^|/)(k8s|kubernetes|manifests|helm|charts|deploy|cloudformation|templates)/'
+          npm=true; trivy=true
+          case "$EVENT" in
+            pull_request|pull_request_target)
+              if [ "$SKIP_DRAFT" = true ] && [ "$DRAFT" = true ]; then
+                npm=false; trivy=false
+                why="a draft pull request: the dependency scanners run when it is marked ready"
+              elif [ "$PR_SCOPE" != true ]; then
+                why="pr_scope is off"
+              elif ! git cat-file -e "${PR_BASE}^{commit}" 2>/dev/null || ! git cat-file -e "${PR_HEAD}^{commit}" 2>/dev/null; then
+                why="the pull request range ${PR_BASE:0:12}...${PR_HEAD:0:12} is not in this clone"
+              elif ! files=$(git diff --name-only "${PR_BASE}...${PR_HEAD}"); then
+                why="git diff ${PR_BASE:0:12}...${PR_HEAD:0:12} failed"
+              else
+                n=$(printf '%s' "$files" | grep -c . || true)
+                grep -qE "$NPM_RE" <<<"$files" || npm=false
+                if [ "$TRIVY_BLOCKING" != true ] && ! grep -qE "$TRIVY_RE" <<<"$files"; then trivy=false; fi
+                why="the pull request changes ${n} file(s)"
+              fi ;;
+            merge_group)
+              # A merge queue entry is scoped like the pull request it carries: what base_sha..head_sha adds. Every path
+              # that cannot decide leaves both scanners on (npm=true trivy=true).
+              if [ "$PR_SCOPE" != true ]; then
+                why="pr_scope is off"
+              elif [ -z "$MG_BASE" ] || [ -z "$MG_HEAD" ] || ! git cat-file -e "${MG_BASE}^{commit}" 2>/dev/null || ! git cat-file -e "${MG_HEAD}^{commit}" 2>/dev/null; then
+                why="the merge group range ${MG_BASE:0:12}...${MG_HEAD:0:12} is not in this clone"
+              elif ! files=$(git diff --name-only "${MG_BASE}...${MG_HEAD}"); then
+                why="git diff ${MG_BASE:0:12}...${MG_HEAD:0:12} failed"
+              else
+                n=$(printf '%s' "$files" | grep -c . || true)
+                grep -qE "$NPM_RE" <<<"$files" || npm=false
+                if [ "$TRIVY_BLOCKING" != true ] && ! grep -qE "$TRIVY_RE" <<<"$files"; then trivy=false; fi
+                why="the merge group changes ${n} file(s)"
+              fi ;;
+            *) why="a ${EVENT} run scans in full" ;;
+          esac
+          echo "npm_audit=${npm}" >> "$GITHUB_OUTPUT"
+          echo "trivy=${trivy}" >> "$GITHUB_OUTPUT"
+          # one stable line per run, so the skip rate can be counted from the logs (G-218 CI CPU)
+          echo "kf-security-scope event=${EVENT} npm_audit=${npm} trivy=${trivy} reason=\"${why}\""
+          {
+            echo "### advisory scanners for this run"
+            echo "- npm-audit: $([ "$npm" = true ] && echo runs || echo "skipped (no manifest, lockfile or .npmrc changed)")"
+            echo "- trivy: $([ "$trivy" = true ] && echo runs || echo "skipped (no dependency, container or IaC file changed)")"
+            echo "- why: ${why}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  npm-audit:
+    needs: gitleaks
+    # Skipped (a passing check) only when the scope step said 'false'; see the pr_scope input.
+    if: ${{ !cancelled() && needs.gitleaks.outputs.npm_audit != 'false' }}
+    runs-on: ${{ (inputs.main_runner != '' && inputs.runner == 'coolify-ci' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) && inputs.main_runner || inputs.runner }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # 2026-07-28: not every consuming repo uses pnpm (e.g. liveagent-ai is
+      # plain npm/package-lock.json). pnpm/action-setup hard-fails on a repo
+      # with no packageManager field and no pnpm-lock.yaml -- that failure
+      # happens before the audit script's own advisory `|| true` can help, so
+      # the package-manager choice has to be made up front.
+      - name: Detect package manager
+        id: pkgmgr
+        shell: bash
+        # 2026-09-24: a pnpm-lock.yaml alone is not proof the repo uses pnpm. dsh-plugins
+        # carries both lockfiles, installs with `npm ci`, and has no packageManager field,
+        # so pnpm/action-setup died with "No pnpm version is specified". Order:
+        #   packageManager: pnpm@x -> pnpm
+        #   package-lock.json      -> npm
+        #   pnpm-lock.yaml only    -> pnpm
+        # The pnpm version itself is pinned below (G-218), never read from the PR.
+        run: |
+          PM=$(jq -r '.packageManager // ""' package.json 2>/dev/null || true)
+          if [[ "$PM" == pnpm@* ]]; then
+            echo "manager=pnpm" >> "$GITHUB_OUTPUT"
+          elif [ -f package-lock.json ]; then
+            echo "manager=npm" >> "$GITHUB_OUTPUT"
+          elif [ -f pnpm-lock.yaml ]; then
+            echo "manager=pnpm" >> "$GITHUB_OUTPUT"
+          else
+            echo "manager=npm" >> "$GITHUB_OUTPUT"
+          fi
+      # G-218 (30.10): the audit must not run anything the PR chooses on a runner whose $HOME persists across jobs.
+      # pnpm/action-setup copies $GITHUB_WORKSPACE/.npmrc into its dest and installs pnpm from that registry, reads
+      # the pnpm version from the PR's package.json, and by default installs into ~/setup-pnpm (persistent /gha-cache).
+      # So: the PR's .npmrc is deleted from the checkout, npm config comes from an empty userconfig plus the public
+      # registry, pnpm is one pinned version (the org's packageManager, published 2026-03-24), installed into
+      # runner.temp, and pnpm never switches to the packageManager version or loads a .pnpmfile. The pinned version
+      # reads lockfile v9 (pnpm 9/10/11 repos); a mismatch with packageManager is a warning, and the audit is advisory.
+      # The audit itself runs in a clean dir under runner.temp that holds only package.json and the lockfile, so no
+      # .npmrc, pnpm-workspace.yaml (registry, pnpmfile, settings) or .pnpmfile from the PR is in reach; for a pnpm
+      # workspace the lockfile's importers carry every package, so the report is the same (checked on adnexus-ai).
+      - name: Keep the PR's npm config out of the audit
+        id: npmcfg
+        shell: bash
+        env:
+          PNPM_PIN: "10.33.0"
+        run: |
+          set -euo pipefail
+          rm -f .npmrc .pnpmfile.*
+          dir="$RUNNER_TEMP/npm-audit-src"
+          rm -rf "$dir" && mkdir "$dir"
+          for f in package.json pnpm-lock.yaml package-lock.json; do
+            # A symlink would hand the audit (and the registry) whatever file it points at, and a package.json that was
+            # skipped would turn the audit off ("nothing to audit", exit 0). So anything at these names that is not a
+            # plain file fails the job; only a repository with no package.json at all skips the audit.
+            if [ -L "$f" ] || { [ -e "$f" ] && [ ! -f "$f" ]; }; then
+              echo "::error::$f is a symlink or not a regular file: the npm audit does not follow it"
+              exit 1
+            fi
+            if [ -f "$f" ]; then cp "$f" "$dir/"; fi
+          done
+          # its own workspace root: without this file pnpm walks UP from runner.temp, and a pnpm-workspace.yaml left in an
+          # ancestor (the persistent work dir) would become the root -- its registry, its pnpmfile, no lockfile
+          printf 'packages:\n  - "."\n' > "$dir/pnpm-workspace.yaml"
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+          : > "$RUNNER_TEMP/npm-audit-userconfig"
+          # pnpm/action-setup reads `packageManager` from this file instead of the PR's package.json (an exact pin and a
+          # different packageManager would otherwise fail with "Multiple versions of pnpm specified").
+          rm -rf .npm-audit-pnpm && mkdir .npm-audit-pnpm && printf '{"private":true}\n' > .npm-audit-pnpm/package.json
+          {
+            echo "NPM_CONFIG_USERCONFIG=$RUNNER_TEMP/npm-audit-userconfig"
+            echo "npm_config_registry=https://registry.npmjs.org/"
+            echo "npm_config_manage_package_manager_versions=false"
+            echo "npm_config_package_manager_strict=false"
+            echo "npm_config_ignore_pnpmfile=true"
+          } >> "$GITHUB_ENV"
+          echo "pnpm_version=$PNPM_PIN" >> "$GITHUB_OUTPUT"
+      - uses: pnpm/action-setup@v4
+        if: steps.pkgmgr.outputs.manager == 'pnpm'
+        with:
+          version: ${{ steps.npmcfg.outputs.pnpm_version }}
+          dest: ${{ runner.temp }}/setup-pnpm
+          package_json_file: .npm-audit-pnpm/package.json
+      # No `cache: pnpm` here: the audit doesn't need a warm store and the cache
+      # Post-step has been flaky (fails the job after an otherwise-green audit).
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+      - name: Audit (findings are advisory; an audit that did not run fails)
+        shell: bash
+        run: |
+          # GitHub runs `shell: bash` as `bash -e -o pipefail`, and npm/pnpm audit exit non-zero whenever they FIND
+          # something: with -e on, any finding killed this step before a line was printed (liveagent-ai, run 41096880034).
+          # So -e is off here, the audit's exit code is kept, and the REPORT decides.
+          set +e -uo pipefail
+          # Findings are advisory: print them, never fail on them (the fix path is Dependabot PRs). But an audit that did
+          # not RUN (an error, no lockfile, a registry failure, an ancestor taking over the root) is not "0 findings": it
+          # fails this job, so a broken audit is red instead of a silent "0 critical, 0 high" (G-218, aa318 on #25).
+          dir="${{ steps.npmcfg.outputs.dir }}"
+          cd "$dir" || exit 1
+          if [ ! -f package.json ]; then
+            echo "No package.json in the repository root: nothing to audit."
+            exit 0
+          fi
+          if [ "${{ steps.pkgmgr.outputs.manager }}" = "pnpm" ]; then
+            rc=0
+            pnpm audit --prod --json --config.ignore-pnpmfile=true --registry=https://registry.npmjs.org/ > audit.json 2> audit.err \
+              || rc=$?
+            ran='(.advisories | type == "object") and (has("error") | not)'
+            high_q='[.advisories[] | select(.severity=="high")] | length'
+            crit_q='[.advisories[] | select(.severity=="critical")] | length'
+          else
+            # --prefix + --workspaces=false: npm must not adopt an ancestor package.json that lists this dir as a workspace
+            rc=0
+            npm audit --omit=dev --json --registry=https://registry.npmjs.org/ --prefix "$dir" --workspaces=false \
+              > audit.json 2> audit.err || rc=$?
+            ran='(.vulnerabilities | type == "object") and (.metadata.vulnerabilities | type == "object") and (has("error") | not)'
+            high_q='.metadata.vulnerabilities.high // 0'
+            crit_q='.metadata.vulnerabilities.critical // 0'
+          fi
+          if ! jq -e "$ran" audit.json > /dev/null 2>&1; then
+            echo "::error::the ${{ steps.pkgmgr.outputs.manager }} audit did not run (no advisory report, exit $rc): see below"
+            jq -c '.error // empty' audit.json 2> /dev/null | head -c 600 || head -c 600 audit.json
+            head -c 800 audit.err
+            exit 1
+          fi
+          HIGH=$(jq "$high_q" audit.json 2> /dev/null)
+          CRIT=$(jq "$crit_q" audit.json 2> /dev/null)
+          # a report of the right shape still has to yield two counts; anything else is an audit that did not run
+          if ! [[ "$HIGH" =~ ^[0-9]+$ && "$CRIT" =~ ^[0-9]+$ ]]; then
+            echo "::error::the ${{ steps.pkgmgr.outputs.manager }} audit did not run (no readable counts, exit $rc)"
+            exit 1
+          fi
+          echo "Audit (${{ steps.pkgmgr.outputs.manager }}): $CRIT critical, $HIGH high (audit exit $rc)"
+          if [ "$CRIT" -gt "0" ]; then
+            echo "::warning::$CRIT critical npm advisories — open a Dependabot PR or update manually"
+          fi
+
+  trivy:
+    # dev-environment-research-2026-09-24.md item #7. ADVISORY on first rollout: HIGH/CRITICAL
+    # findings are reported (job summary + annotation + `trivy-report` artifact) but do NOT fail
+    # the `security` check unless the caller passes `trivy_blocking: true`. A scan/infra error
+    # (trivy download, vuln-DB fetch) is also advisory unless blocking is on.
+    #
+    # Deliberately NOT `continue-on-error: true`: at job level GitHub still shows the job as
+    # FAILED on the check (that stalled kwn #1865). The scan step instead always exits 0 and a
+    # separate "Enforce" step fails the job only when the caller opted in.
+    needs: gitleaks
+    # Skipped (a passing check) only when the scope step said 'false', which it never does with trivy_blocking: true.
+    if: ${{ !cancelled() && needs.gitleaks.outputs.trivy != 'false' }}
+    runs-on: ${{ (inputs.main_runner != '' && inputs.runner == 'coolify-ci' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) && inputs.main_runner || inputs.runner }}
+    # 12 min = the install's 92 s worst case (its budget is in the scan step) + the scan's own `--timeout 8m` + checkout, SARIF
+    # conversion, summary and report upload, with slack. 10 min left 28 s for all of it after a slow install.
+    timeout-minutes: 12
+    # Least privilege: the scan reads the checkout only (artifact upload uses the runtime token).
+    permissions:
+      contents: read
+    env:
+      TRIVY_VERSION: "0.76.1"
+      TRIVY_SHA256_X64: "c7cbe3137fb8a48a17574bede3dd6beb16742d1e9772929940fc90082c39d9c0"
+      TRIVY_SHA256_ARM64: "e174dff2a6dba5e3ae41f8d0537a6324405bd08132497340304c6b20e0f16a1f"
+      TRIVY_BLOCKING: ${{ inputs.trivy_blocking }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: trivy fs (vuln, secret, misconfig — HIGH/CRITICAL)
+        id: scan
+        shell: bash
+        run: |
+          # No `set -e`: every failure is captured into STATUS so advisory mode can never go red.
+          set -uo pipefail
+          REPORT_DIR="$RUNNER_TEMP/trivy-report"
+          JSON="$REPORT_DIR/trivy.json"
+          mkdir -p "$REPORT_DIR"
+          STATUS=ok
+          ERR=""
+
+          # Reuse a runner-provided trivy when present; otherwise install the pinned release
+          # into RUNNER_TEMP with its checksum verified.
+          #
+          # The download has a hard time budget. github.com's release endpoint answered 503/504 for stretches on 2026-11-08
+          # and can also HANG; the old `--retry 5 --max-time 120` with no total cap took up to 6 x 120 s + 5 x 5 s = 745 s,
+          # past this job's old 10-minute limit, so the advisory job ended cancelled instead of with the warning below.
+          # `timeout` bounds the whole curl call including curl's own retries (up to 3 tries of 30 s, 2 s apart): 90 s, plus
+          # at most 2 s of kill grace = 92 s. The asset is 52.7 MB (x64) / 47.4 MB (arm64), so 30 s a try needs about
+          # 14 Mbit/s. The job timeout below covers this, the scan's own 8-minute --timeout, checkout and reporting.
+          TRIVY="$(command -v trivy || true)"
+          if [ -z "$TRIVY" ]; then
+            case "$(uname -m)" in
+              x86_64)        ASSET=Linux-64bit; SHA="$TRIVY_SHA256_X64" ;;
+              aarch64|arm64) ASSET=Linux-ARM64; SHA="$TRIVY_SHA256_ARM64" ;;
+              *)             ASSET=""; SHA="" ;;
+            esac
+            TARBALL="trivy_${TRIVY_VERSION}_${ASSET}.tar.gz"
+            if [ -z "$ASSET" ]; then
+              STATUS=error
+              ERR="could not install trivy ${TRIVY_VERSION} for $(uname -m): no pinned build for this architecture"
+            elif ! timeout -k 2 90 curl -fsSL --retry 2 --retry-all-errors --retry-delay 2 --connect-timeout 10 --max-time 30 \
+                   -o "$RUNNER_TEMP/$TARBALL" \
+                   "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${TARBALL}"; then
+              rm -f "$RUNNER_TEMP/$TARBALL"
+              STATUS=error
+              ERR="could not install trivy ${TRIVY_VERSION} for $(uname -m): download failed or used up its 90 s budget"
+            elif ! echo "${SHA}  $RUNNER_TEMP/$TARBALL" | sha256sum -c - >/dev/null; then
+              rm -f "$RUNNER_TEMP/$TARBALL"
+              STATUS=error
+              ERR="could not install trivy ${TRIVY_VERSION} for $(uname -m): sha256 mismatch, not extracted"
+            elif ! tar -xzf "$RUNNER_TEMP/$TARBALL" -C "$RUNNER_TEMP" trivy; then
+              STATUS=error
+              ERR="could not install trivy ${TRIVY_VERSION} for $(uname -m): extract failed"
+            else
+              TRIVY="$RUNNER_TEMP/trivy"
+            fi
+          fi
+
+          if [ "$STATUS" = ok ]; then
+            echo "Using $("$TRIVY" --version | head -1) at $TRIVY"
+            # --exit-code 0: findings never fail this step; enforcement is the separate step below.
+            if ! "$TRIVY" fs \
+                --scanners vuln,secret,misconfig \
+                --severity HIGH,CRITICAL \
+                --exit-code 0 \
+                --timeout 8m \
+                --format json --output "$JSON" \
+                . 2> >(tee "$REPORT_DIR/trivy.log" >&2); then
+              STATUS=error
+              ERR="trivy fs exited non-zero (see trivy.log in the trivy-report artifact)"
+            elif ! jq -e 'has("SchemaVersion")' "$JSON" >/dev/null 2>&1; then
+              STATUS=error
+              ERR="trivy produced no parsable JSON report"
+            fi
+          fi
+          if [ "$STATUS" = ok ]; then
+            "$TRIVY" convert --format sarif --output "$REPORT_DIR/trivy.sarif" "$JSON" \
+              || echo "::warning::trivy: SARIF conversion failed — JSON report is still in the artifact"
+          fi
+
+          # Counts per scanner x severity. The Status filter applies to misconfig only (FAIL vs PASS):
+          # a vulnerability's .Status is its fix state ("fixed", "affected"), not pass/fail.
+          count() {
+            jq --arg k "$1" --arg s "$2" \
+              '[.Results[]? | .[$k][]? | select(.Severity == $s) | select($k != "Misconfigurations" or (.Status // "FAIL") == "FAIL")] | length' \
+              "$JSON" 2>/dev/null || echo 0
+          }
+          if [ "$STATUS" = ok ]; then
+            V_C=$(count Vulnerabilities CRITICAL);   V_H=$(count Vulnerabilities HIGH)
+            S_C=$(count Secrets CRITICAL);           S_H=$(count Secrets HIGH)
+            M_C=$(count Misconfigurations CRITICAL); M_H=$(count Misconfigurations HIGH)
+          else
+            V_C=0; V_H=0; S_C=0; S_H=0; M_C=0; M_H=0
+          fi
+          CRIT=$((V_C + S_C + M_C))
+          HIGH=$((V_H + S_H + M_H))
+          TOTAL=$((CRIT + HIGH))
+
+          if [ "$TRIVY_BLOCKING" = "true" ]; then MODE="blocking (trivy_blocking: true)"; else MODE="advisory (trivy_blocking: false — findings do not fail the check)"; fi
+          {
+            echo "## trivy — HIGH/CRITICAL"
+            echo
+            echo "Mode: **${MODE}**"
+            echo
+            if [ "$STATUS" != ok ]; then
+              echo "> Scan did not complete: ${ERR}"
+            else
+              echo "| Scanner | CRITICAL | HIGH |"
+              echo "|---|---:|---:|"
+              echo "| vulnerabilities | ${V_C} | ${V_H} |"
+              echo "| secrets | ${S_C} | ${S_H} |"
+              echo "| misconfigurations | ${M_C} | ${M_H} |"
+              echo "| **total** | **${CRIT}** | **${HIGH}** |"
+              if [ "$TOTAL" -gt 0 ]; then
+                echo
+                echo "<details><summary>Findings (first 50)</summary>"
+                echo
+                echo "| Severity | Type | ID | Detail | Target |"
+                echo "|---|---|---|---|---|"
+                # Secret rows carry the rule id + location only — never the matched value.
+                jq -r '
+                  def esc: tostring | gsub("\\|"; "\\|") | gsub("\n"; " ");
+                  [ .Results[]? as $r
+                    | ( ($r.Vulnerabilities // [])[] | [.Severity, "vuln", .VulnerabilityID, "\(.PkgName) \(.InstalledVersion) -> \(.FixedVersion // "no fix")", $r.Target] ),
+                      ( ($r.Secrets // [])[] | [.Severity, "secret", .RuleID, (.Title // ""), "\($r.Target):\(.StartLine)"] ),
+                      ( ($r.Misconfigurations // [])[] | select((.Status // "FAIL") == "FAIL") | [.Severity, "misconfig", .ID, (.Title // ""), $r.Target] )
+                  ] | sort_by(if .[0] == "CRITICAL" then 0 else 1 end) | .[:50][]
+                  | "| " + (map(esc) | join(" | ")) + " |"' "$JSON" 2>/dev/null
+                echo
+                echo "</details>"
+              fi
+            fi
+            echo
+            echo "Full JSON + SARIF report: \`trivy-report\` artifact on this run."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "trivy: status=${STATUS} critical=${CRIT} high=${HIGH} (vuln ${V_C}/${V_H}, secret ${S_C}/${S_H}, misconfig ${M_C}/${M_H})"
+          if [ "$STATUS" != ok ]; then
+            echo "::warning title=trivy::${ERR}"
+          elif [ "$TOTAL" -gt 0 ]; then
+            echo "::warning title=trivy::${CRIT} critical + ${HIGH} high finding(s) — see the job summary / trivy-report artifact"
+          fi
+          {
+            echo "status=${STATUS}"
+            echo "critical=${CRIT}"
+            echo "high=${HIGH}"
+            echo "total=${TOTAL}"
+          } >> "$GITHUB_OUTPUT"
+          exit 0
+      - name: Upload trivy report
+        if: ${{ always() }}
+        # a full artifact quota must never fail the job (G-218); the scan or test verdict is decided by its own step
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-report
+          path: ${{ runner.temp }}/trivy-report/
+          if-no-files-found: warn
+          retention-days: 3
+      - name: Enforce (only when trivy_blocking is true)
+        if: ${{ inputs.trivy_blocking }}
+        shell: bash
+        env:
+          STATUS: ${{ steps.scan.outputs.status }}
+          TOTAL: ${{ steps.scan.outputs.total }}
+        run: |
+          if [ "$STATUS" != "ok" ]; then
+            echo "::error title=trivy::scan did not complete and trivy_blocking is true"
+            exit 1
+          fi
+          if [ "${TOTAL:-0}" -gt 0 ]; then
+            echo "::error title=trivy::${TOTAL} HIGH/CRITICAL finding(s) and trivy_blocking is true"
+            exit 1
+          fi
+          echo "trivy: no HIGH/CRITICAL findings"
+
+  zap-baseline:
+    # Opt-in + non-blocking (dev-environment-research item #7): runs only when the caller passes
+    # `preview_url` (e.g. once a PR is Ready for review and its Coolify preview is live).
+    # `fail_action: false` keeps findings advisory. The step-level (NOT job-level)
+    # continue-on-error absorbs infra errors (docker pull, unreachable preview) — at step level
+    # the job still concludes `success`, unlike job-level continue-on-error.
+    # `allow_issue_writing: false`: callers grant no `issues: write`, and findings belong in the
+    # run artifact, not auto-filed issues.
+    if: ${{ inputs.preview_url != '' && !(inputs.skip_heavy_on_draft && github.event.pull_request.draft) }}
+    runs-on: ${{ (inputs.main_runner != '' && inputs.runner == 'coolify-ci' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) && inputs.main_runner || inputs.runner }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: ZAP baseline scan
+        id: zap
+        continue-on-error: true
+        uses: zaproxy/action-baseline@v0.15.0
+        with:
+          target: ${{ inputs.preview_url }}
+          cmd_options: "-z '-silent'"
+          fail_action: false
+          allow_issue_writing: false
+          artifact_name: zap-baseline-report
+      - name: ZAP summary
+        if: ${{ always() }}
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.zap.outcome }}
+          TARGET: ${{ inputs.preview_url }}
+        run: |
+          {
+            echo "## ZAP baseline (advisory)"
+            echo
+            echo "Target: ${TARGET}"
+            echo
+            echo "Scan step outcome: **${OUTCOME}** — findings never fail the check; report in the \`zap-baseline-report\` artifact."
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$OUTCOME" != "success" ]; then
+            echo "::warning title=zap-baseline::ZAP scan step did not complete (${OUTCOME}) — check the step log"
+          fi
+
+  codeql:
+    # Default: the caller's weekly schedule and manual dispatch only (see `codeql-every-push`). A skipped job
+    # never fails the call, so callers' `security` gates are unchanged.
+    if: ${{ !inputs.skip-codeql && (inputs.codeql-every-push || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && !(inputs.skip_heavy_on_draft && github.event.pull_request.draft) }}
+    runs-on: ${{ (inputs.main_runner != '' && inputs.runner == 'coolify-ci' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) && inputs.main_runner || inputs.runner }}
+    timeout-minutes: 15
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ inputs.language }}
+      # SARIF upload requires "Code Security" (code scanning) enabled on the repo.
+      # When it's off, analyze runs fine but the upload errors with a configuration
+      # error. continue-on-error keeps the gate green; findings still upload once the
+      # repo setting is enabled. Flip this to a hard failure org-wide after enabling.
+      - uses: github/codeql-action/analyze@v3
+        continue-on-error: true
+        with:
+          category: "/language:${{ inputs.language }}"
