@@ -1,0 +1,90 @@
+# This repository's own offline tests of security-shared.yml, on every pull request that touches the workflow or the tests
+# (T-11386, G-218): the isolation guard test (T-11229, extended by T-11386) and the scheduled-scan test (T-11668). Until
+# this file, nothing ran them: the shared workflows here are only ever `uses:`-called by other repositories, so a change to
+# security-shared.yml reached every repository's security check with its tests unrun. Nothing calls this workflow.
+#
+# Only these two tests run here. tests/trivy-download.test.sh cuts the trivy install out of the step by its old first line
+# (TRIVY="$(command -v trivy ...), which T-11229 replaced, so it no longer finds its block; the two gitleaks download / log
+# tests are not proven against the current workflow either. Each joins this job in the change that brings it up to date.
+#
+# Switched off, and the default is that it stays off: this repository is PUBLIC, and on 2026-11-13 every runner group of the
+# org had "allow public repositories" off, so a coolify-ci job here would wait 24 h for a runner and then fail. The job
+# reports "skipped" until the repository variable GUARD_TESTS_ON_COOLIFY_CI is true AND a runner group that serves
+# coolify-ci admits this repository. Admitting it is an OWNER decision, not a routine step: a `pull_request` run takes its
+# workflow file from the pull request's merge commit, so a fork can change or drop the `if:` below, or add a workflow of its
+# own with `runs-on: coolify-ci`. Fork code could then run on the runner as root, next to the host's docker socket and the
+# shared runner cache that security-shared.yml keeps its jobs away from. Only safe with BOTH: approval required for every
+# outside contributor's run (org setting), and a runner group of its own with no shared cache and no host docker socket.
+# Never a GitHub-hosted runner (house rule: CI runs on coolify-ci only).
+name: guard-tests
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/security-shared.yml"
+      - ".github/workflows/guard-tests.yml"
+      - "tests/**"
+permissions:
+  contents: read
+concurrency:
+  group: guard-tests-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  guard-tests:
+    # Branches of this repository only, once the variable above is set. The head-repo test skips a fork's pull request as
+    # long as the fork keeps this file as it is; it is no barrier, since the fork's own copy of this file is what runs (see
+    # the header).
+    if: ${{ vars.GUARD_TESTS_ON_COOLIFY_CI == 'true' && github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: coolify-ci
+    timeout-minutes: 10
+    # The same isolation the security jobs have (T-11229): a fixed PATH, a shell given by absolute path, HOME and TMPDIR
+    # under RUNNER_TEMP, a checkout that keeps no credentials. PyYAML (the guard test reads the workflow with it; the runner's
+    # python3 has none) is one pinned version, checked against its sha256, installed into a venv under RUNNER_TEMP.
+    env:
+      PATH: /usr/bin:/bin:/usr/sbin:/sbin
+      PYTHONNOUSERSITE: '1'
+    defaults:
+      run:
+        shell: /usr/bin/bash --noprofile --norc -eo pipefail {0}
+    steps:
+      - name: isolate (HOME, the caches and TMPDIR under RUNNER_TEMP)
+        run: |
+          d="$RUNNER_TEMP/h"
+          umask 077
+          mkdir -p "$d"/.config "$d"/.cache "$d"/tmp
+          : > "$d/.gitconfig"
+          {
+            echo "HOME=$d"
+            echo "XDG_CONFIG_HOME=$d/.config"
+            echo "XDG_CACHE_HOME=$d/.cache"
+            echo "TMPDIR=$d/tmp"
+            echo "GIT_CONFIG_GLOBAL=$d/.gitconfig"
+          } >> "$GITHUB_ENV"
+          echo "isolate: HOME=$d"
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: PyYAML (one pinned version, sha256-checked, in a venv under RUNNER_TEMP)
+        env:
+          # no pip.conf from the image or a cache dir: the public index, hash-checking mode, no cache
+          PIP_CONFIG_FILE: /dev/null
+        run: |
+          v="$RUNNER_TEMP/venv"
+          /usr/bin/python3 -I -m venv "$v"
+          # sha256 of the PyYAML 6.0.3 wheels for CPython 3.12 and 3.13 on linux x86_64 and aarch64, from PyPI. Bump together.
+          {
+            echo "pyyaml==6.0.3 \\"
+            echo "  --hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc \\"
+            echo "  --hash=sha256:9149cad251584d5fb4981be1ecde53a1ca46c891a79788c0df828d2f166bda28 \\"
+            echo "  --hash=sha256:0f29edc409a6392443abf94b9cf89ce99889a1dd5376d94316ae5145dfedd5d6 \\"
+            echo "  --hash=sha256:ee2922902c45ae8ccada2c5b501ab86c36525b883eff4255313a253a3160861c"
+          } > "$RUNNER_TEMP/guard-tests-requirements.txt"
+          "$v/bin/python3" -I -m pip install --quiet --disable-pip-version-check --no-input --no-cache-dir --root-user-action=ignore \
+            --only-binary=:all: --require-hashes -r "$RUNNER_TEMP/guard-tests-requirements.txt"
+          "$v/bin/python3" -I -c 'import sys, yaml; print("PyYAML", yaml.__version__, "on python", sys.version.split()[0])'
+          echo "$v/bin" >> "$GITHUB_PATH"
+      - name: security-shared guard test (T-11229, T-11386)
+        run: bash tests/security-shared-guard.test.sh
+      - name: gitleaks scheduled-scan test (T-11668)
+        # runs even when the guard test failed, so one red test never hides the other's result
+        if: ${{ !cancelled() }}
+        run: bash tests/gitleaks-scheduled-scan.test.sh
