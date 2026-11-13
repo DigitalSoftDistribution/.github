@@ -262,6 +262,9 @@ jobs:
           GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
           TMPDIR: ${{ runner.temp }}
       - name: gitleaks (licensed action) guard (the gitleaks it ran is its own install under RUNNER_TEMP; T-11386)
+        # It runs unless cancelled, so it still shows which gitleaks ran when the action failed on findings. After an earlier
+        # failure (the checkout, the cache guard, the action's own install) it adds "no gitleaks on PATH after the action":
+        # then the first error of the job is the cause, not this one.
         if: ${{ !cancelled() && env.GITLEAKS_LICENSED == 'true' }}
         run: |
           set +e -uo pipefail
@@ -918,8 +921,9 @@ jobs:
       # writable by every earlier job of any org repo; a job cannot point it elsewhere) whenever one sat there, and the pnpm
       # that pnpm/action-setup installs is a script that runs whatever `node` is first on PATH. This step installs one pinned
       # node under RUNNER_TEMP: nodejs.org's release tarball, sha256-checked before anything is extracted. When that fails
-      # (download, budget, checksum, extract) the audit runs on the image's own /usr/bin/node (installed from the distro
-      # package when the image was built; no cache dir) and says so. Never the tool cache. No `cache: pnpm`, no store cache.
+      # (download, budget, checksum, an extract that errors) the audit runs on the image's own /usr/bin/node (NodeSource's
+      # package, installed when the image was built; no cache dir) and says so. Never the tool cache. A hung extract has no
+      # fallback: the step's 3-minute timeout fails the job (fail-closed). No `cache: pnpm`, no store cache.
       - name: node (pinned, sha256-verified, under RUNNER_TEMP; never the runner's tool cache; T-11386)
         # the download's caps are summed below (92 s); the step timeout is a backstop above that
         timeout-minutes: 3

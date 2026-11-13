@@ -7,10 +7,14 @@
 # (TRIVY="$(command -v trivy ...), which T-11229 replaced, so it no longer finds its block; the two gitleaks download / log
 # tests are not proven against the current workflow either. Each joins this job in the change that brings it up to date.
 #
-# Switched off until a runner can take it: this repository is PUBLIC, and on 2026-11-13 every runner group of the org had
-# "allow public repositories" off, so a coolify-ci job here would wait 24 h for a runner and then fail on every pull request.
-# The job runs once an org admin (1) adds this repository to a runner group that serves coolify-ci and allows public
-# repositories, and (2) sets the repository variable GUARD_TESTS_ON_COOLIFY_CI to true. Until then it reports "skipped".
+# Switched off, and the default is that it stays off: this repository is PUBLIC, and on 2026-11-13 every runner group of the
+# org had "allow public repositories" off, so a coolify-ci job here would wait 24 h for a runner and then fail. The job
+# reports "skipped" until the repository variable GUARD_TESTS_ON_COOLIFY_CI is true AND a runner group that serves
+# coolify-ci admits this repository. Admitting it is an OWNER decision, not a routine step: a `pull_request` run takes its
+# workflow file from the pull request's merge commit, so a fork can change or drop the `if:` below, or add a workflow of its
+# own with `runs-on: coolify-ci`. Fork code could then run on the runner as root, next to the host's docker socket and the
+# shared runner cache that security-shared.yml keeps its jobs away from. Only safe with BOTH: approval required for every
+# outside contributor's run (org setting), and a runner group of its own with no shared cache and no host docker socket.
 # Never a GitHub-hosted runner (house rule: CI runs on coolify-ci only).
 name: guard-tests
 on:
@@ -26,8 +30,9 @@ concurrency:
   cancel-in-progress: true
 jobs:
   guard-tests:
-    # This repository is public and the runner is self-hosted: a pull request from a fork never runs on it (the job is
-    # skipped, which passes). Branches of this repository run, once the variable above is set.
+    # Branches of this repository only, once the variable above is set. The head-repo test skips a fork's pull request as
+    # long as the fork keeps this file as it is; it is no barrier, since the fork's own copy of this file is what runs (see
+    # the header).
     if: ${{ vars.GUARD_TESTS_ON_COOLIFY_CI == 'true' && github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: coolify-ci
     timeout-minutes: 10

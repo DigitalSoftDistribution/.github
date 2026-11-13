@@ -11,10 +11,14 @@ PATH and PYTHONNOUSERSITE, the shell is an absolute path and no step overrides i
 actions/setup-node, a pinned and sha256-checked node step and a tool guard before the audit; the gitleaks job env holds no
 licence, the licensed action gets it in its own env with TMPDIR under RUNNER_TEMP, and a guard step follows it.
 The same checks FAIL on the old file (negative control) and on mutations of the new one.
-Part 2, behaviour: the isolate step, the guard step and npm-audit's tool guard, extracted from the YAML, run in bash under a
-cleared environment. The runner's cache root and the "image PATH" are fixture directories (each guard text is patched on exactly
-two lines, asserted), so no root and no /gha-cache are needed. Green on a clean job, red on each way the cache can still reach it."""
+Part 2, behaviour: the isolate step, the guard step, npm-audit's tool guard and node step, and the licensed gitleaks guard,
+extracted from the YAML, run in bash under a cleared environment. The runner's cache root and the "image PATH" are fixture
+directories (each guard text is patched on exactly two lines, asserted), so no root and no /gha-cache are needed. Green on a
+clean job, red on each way the cache can still reach it, and red for node or npm outside both RUNNER_TEMP and the image's /usr.
+The node step runs with a fake curl, tar and uname (no network) and the image's /usr/bin/node and npm moved to a fixture dir:
+a download whose sha256 does not match is never extracted and the fallback is taken; a matching one is extracted and put on PATH."""
 import copy
+import hashlib
 import os
 import re
 import shutil
@@ -425,6 +429,71 @@ try:
     r = tg(PATH=f"{PNPM}:{BIN}")
     check("no node on PATH: red, names node", (r.returncode, "node is not on PATH" in r.stdout), (1, True))
     check("RUNNER_TEMP empty: red", tg(RUNNER_TEMP="").returncode, 1)
+    # node and npm in a dir that is neither under RUNNER_TEMP nor the image's /usr, which the patched fixed-PATH line admits:
+    # the PATH check passes, so only the check of where each tool resolves can flag them
+    script(f"{T}/binn/node", "echo v22.23.5")
+    script(f"{T}/binn/npm", "exit 0")
+    r = tg(TG.replace(a, f"\ncache={CACHE}\n").replace(b, f"\nsafe={BIN}:{T}/binn\n"), PATH=f"{T}/binn:{PNPM}:{BIN}")
+    out_rt = "resolves outside RUNNER_TEMP and the image's /usr/bin and /usr/lib/node_modules"
+    check("node and npm outside RUNNER_TEMP and /usr, on a fixed PATH dir: red, names both",
+          (r.returncode, f"node {out_rt}" in r.stdout, f"npm {out_rt}" in r.stdout), (1, True, True))
+
+    print("node step of npm-audit (T-11386): a fake curl, tar and uname stand in for the download (no network)")
+    NS = [s for s in new["jobs"]["npm-audit"]["steps"] if str(s.get("name", "")).startswith("node (pinned")][0]
+    NODE_RUN, NENV = str(NS["run"]), {k: str(v) for k, v in (NS.get("env") or {}).items()}
+    V = NENV["NODE_VERSION"]
+    assert NODE_RUN.count("/usr/bin/node") >= 1 and NODE_RUN.count("/usr/bin/npm") >= 1, "the node step's fallback must name /usr/bin/node and /usr/bin/npm"
+    IMG, NB = f"{T}/image", f"{T}/nodestep-bin"
+    script(f"{IMG}/usr/bin/node", "echo v24.0.0")
+    script(f"{IMG}/usr/bin/npm", "exit 0")
+    NR = NODE_RUN.replace("/usr/bin/node", f"{IMG}/usr/bin/node").replace("/usr/bin/npm", f"{IMG}/usr/bin/npm")
+    FAKE_TGZ = b"not the node tarball\n"
+    # the fake curl writes FAKE_TGZ to its -o file; the fake tar records that it ran and lays out a node that reports V
+    script(f"{NB}/curl", 'while [ $# -gt 0 ]; do if [ "$1" = -o ]; then shift; printf "not the node tarball\\n" > "$1"; fi; shift; done; exit 0')
+    script(f"{NB}/tar", f'd=""; while [ $# -gt 0 ]; do if [ "$1" = -C ]; then shift; d=$1; fi; shift; done; : > "{T}/tar-ran"; '
+                        f'mkdir -p "$d/bin" && printf "#!/bin/sh\\necho v{V}\\n" > "$d/bin/node" && chmod 755 "$d/bin/node"')
+    script(f"{NB}/uname", "echo x86_64")
+
+    def node_step(rt, **over):
+        os.makedirs(rt)
+        gp = f"{rt}.github_path"
+        open(gp, "w").close()
+        e = dict(NENV, PATH=f"{NB}:{SAFE}", RUNNER_TEMP=rt, GITHUB_PATH=gp)
+        e.update(over)
+        args = ["/usr/bin/env", "-i"] + [f"{k}={v}" for k, v in e.items()] + ["/usr/bin/bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", NR]
+        return subprocess.run(args, capture_output=True, text=True), open(gp).read()
+
+    r, gpath = node_step(f"{T}/rt-badsha")
+    check("node step, a download whose sha256 does not match: not extracted, nothing on PATH, the image's node with a warning",
+          (r.returncode, os.path.exists(f"{T}/tar-ran"), os.listdir(f"{T}/rt-badsha"), gpath,
+           f"::warning title=node::node {V} not installed (sha256 mismatch for node-v{V}-linux-x64.tar.xz, not extracted)" in r.stdout),
+          (0, False, [], "", True))
+    r, gpath = node_step(f"{T}/rt-goodsha", NODE_SHA256_X64=hashlib.sha256(FAKE_TGZ).hexdigest())
+    check("node step, the same download with a matching sha256 (the harness works): extracted under RUNNER_TEMP and put on PATH",
+          (r.returncode, os.path.exists(f"{T}/tar-ran"), gpath, f"node {V}: installed from nodejs.org under RUNNER_TEMP, sha256 verified" in r.stdout),
+          (0, True, f"{T}/rt-goodsha/node/bin\n", True))
+
+    print("licensed gitleaks guard (T-11386)")
+    LG = step_run(new, "gitleaks", "gitleaks (licensed action) guard")
+
+    def lg(path):
+        args = ["/usr/bin/env", "-i", f"PATH={path}", f"RUNNER_TEMP={RT}", "/usr/bin/bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", LG]
+        return subprocess.run(args, capture_output=True, text=True)
+
+    script(f"{RT}/gl-tmp/gitleaks-x/gitleaks", "exit 0")  # where the action installs it, TMPDIR being under RUNNER_TEMP
+    r = lg(f"{RT}/gl-tmp/gitleaks-x:{BIN}")
+    check("licensed guard, the action's gitleaks under RUNNER_TEMP: green, says so",
+          (r.returncode, "ok, the licensed action ran its own gitleaks under RUNNER_TEMP" in r.stdout), (0, True))
+    script(f"{CACHE}/toolcache/gitleaks/gitleaks", "exit 0")
+    r = lg(f"{CACHE}/toolcache/gitleaks:{RT}/gl-tmp/gitleaks-x:{BIN}")
+    check("licensed guard, a gitleaks outside RUNNER_TEMP first on PATH: red, names it",
+          (r.returncode, "gitleaks (licensed action) is not under RUNNER_TEMP" in r.stdout), (1, True))
+    os.makedirs(f"{RT}/gl-link")
+    os.symlink(f"{CACHE}/toolcache/gitleaks/gitleaks", f"{RT}/gl-link/gitleaks")
+    r = lg(f"{RT}/gl-link:{BIN}")
+    check("licensed guard, a gitleaks under RUNNER_TEMP that links into the cache: red", (r.returncode, "is not under RUNNER_TEMP" in r.stdout), (1, True))
+    r = lg(BIN)
+    check("licensed guard, no gitleaks on PATH: red", (r.returncode, "no gitleaks on PATH after the action" in r.stdout), (1, True))
 finally:
     shutil.rmtree(T, ignore_errors=True)
 
