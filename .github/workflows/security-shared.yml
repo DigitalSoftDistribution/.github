@@ -116,14 +116,120 @@ jobs:
     # it (GitHub Actions forbids `secrets.*` directly inside `if:`).
     env:
       GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+      PATH: /usr/bin:/bin:/usr/sbin:/sbin
+      PYTHONNOUSERSITE: '1'
+    # T-11229 (G-218): the runner's HOME, its caches and the first directory on PATH sit on a per-runner cache that every
+    # earlier job, of any repo in the org, could write. This job starts from a fresh HOME under RUNNER_TEMP, a fixed PATH
+    # and a shell given by absolute path (the runner resolves a bare `shell: bash` through ITS OWN PATH, which job env
+    # cannot change), and the guard step proves it before anything reads the checkout.
+    defaults:
+      run:
+        shell: /usr/bin/bash --noprofile --norc -eo pipefail {0}
     # Which advisory scanners this run needs (the `scope` step, last in this job). Anything but 'false' runs the scanner,
     # so a scope step that never ran (cancelled, crashed) fails open: npm-audit and trivy run as before.
     outputs:
       npm_audit: ${{ steps.scope.outputs.npm_audit }}
       trivy: ${{ steps.scope.outputs.trivy }}
     steps:
+      - name: isolate (fresh HOME and caches under RUNNER_TEMP, nothing from the runner's cache; T-11229)
+        run: |
+          [ "$PATH" = /usr/bin:/bin:/usr/sbin:/sbin ] || { echo "::error title=runner cache guard::PATH is not the fixed one: $PATH"; exit 1; }
+          d="$RUNNER_TEMP/h"
+          umask 077
+          mkdir -p "$d"/.config "$d"/.cache "$d"/.local/share "$d"/.local/state "$d"/.npm "$d"/.pnpm-store "$d"/.corepack \
+            "$d"/.cargo "$d"/.rustup "$d"/.yarn "$d"/.next-cache "$d"/.pw
+          : > "$d/.gitconfig"
+          {
+            echo "HOME=$d"
+            echo "XDG_CONFIG_HOME=$d/.config"
+            echo "XDG_CACHE_HOME=$d/.cache"
+            echo "XDG_DATA_HOME=$d/.local/share"
+            echo "XDG_STATE_HOME=$d/.local/state"
+            echo "npm_config_cache=$d/.npm"
+            echo "npm_config_store_dir=$d/.pnpm-store"
+            echo "COREPACK_HOME=$d/.corepack"
+            echo "CARGO_HOME=$d/.cargo"
+            echo "RUSTUP_HOME=$d/.rustup"
+            echo "YARN_CACHE_FOLDER=$d/.yarn"
+            echo "NEXT_CACHE_DIR=$d/.next-cache"
+            echo "PLAYWRIGHT_BROWSERS_PATH=$d/.pw"
+            echo "GIT_CONFIG_GLOBAL=$d/.gitconfig"
+          } >> "$GITHUB_ENV"
+          echo "isolate: HOME=$d"
       - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: runner cache guard (nothing from the runner's cache; the paths it checked are printed)
+        run: |
+          # The runner image points HOME, CARGO_HOME, the npm/pnpm/yarn caches and the tool cache at /gha-cache and puts
+          # /gha-cache/cargo/bin first on PATH. That directory belongs to the runner, not to the job: every job on that runner
+          # writes it and the next job, of ANY repo in the org, reads it. This step proves the isolate step and the job's own
+          # env (PATH, PYTHONNOUSERSITE, shell) took effect, and fails the job before anything reads the checkout when not.
+          # It sets nothing up. Its printed paths are the proof a run shows.
+          set +e -uo pipefail
+          cache=/gha-cache
+          safe=/usr/bin:/bin:/usr/sbin:/sbin
+          fail=0
+          bad() { echo "::error title=runner cache guard::$*"; fail=1; }
+          # under <path> <dir>: the path is the dir or lies below it
+          under() { case "$1/" in "$2"/*) return 0 ;; esac; return 1; }
+          # RUNNER_TOOL_CACHE and AGENT_TOOLSDIRECTORY are the runner's own and GITHUB_ENV cannot change them: a tool that
+          # resolves there is as bad as one under /gha-cache
+          in_cache() {
+            under "$1" "$cache" && return 0
+            [ -n "${RUNNER_TOOL_CACHE:-}" ] && under "$1" "$RUNNER_TOOL_CACHE" && return 0
+            [ -n "${AGENT_TOOLSDIRECTORY:-}" ] && under "$1" "$AGENT_TOOLSDIRECTORY" && return 0
+            return 1
+          }
+          tmp=${RUNNER_TEMP:-}
+          if [ -z "$tmp" ] || [ ! -d "$tmp" ]; then
+            bad "RUNNER_TEMP is not a directory (${tmp:-unset})"
+            tmp=/nonexistent-runner-temp
+          fi
+          for v in HOME XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME XDG_STATE_HOME npm_config_cache npm_config_store_dir COREPACK_HOME; do
+            val=${!v:-}
+            if [ -z "$val" ]; then bad "$v is not set: the isolate step did not run"
+            elif ! under "$val" "$tmp"; then bad "$v=$val is not under RUNNER_TEMP ($tmp)"
+            fi
+          done
+          if [ "$PATH" != "$safe" ]; then bad "PATH is not the image's own dirs: PATH=$PATH (want $safe)"; fi
+          # a tool the image does not carry is not a hole; one that is there must resolve (symlinks followed) outside the cache
+          for t in bash git gh python3 node jq curl; do
+            if ! p=$(command -v "$t"); then
+              if [ "$t" = bash ]; then bad "bash is not on PATH"; else echo "runner cache guard: $t: not on PATH"; fi
+              continue
+            fi
+            r=$(/usr/bin/readlink -f "$p")
+            echo "runner cache guard: $t: $p -> $r"
+            if in_cache "$p" || in_cache "$r"; then bad "$t resolves into the runner's cache: $p -> $r"; fi
+          done
+          # the global git config: only safe.directory (what actions/checkout adds), and the file is HOME's own
+          if [ -n "${GIT_CONFIG_GLOBAL:-}" ] && [ "$GIT_CONFIG_GLOBAL" != "${HOME:-}/.gitconfig" ]; then
+            bad "GIT_CONFIG_GLOBAL=$GIT_CONFIG_GLOBAL is not HOME's own .gitconfig"
+          fi
+          if command -v git > /dev/null 2>&1; then
+            keys=$(git config --global --name-only --list 2> /dev/null | /usr/bin/sort -u | /usr/bin/grep -v -x 'safe.directory' || true)
+            if [ -n "$keys" ]; then bad "the global git config holds more than safe.directory: $(echo "$keys" | /usr/bin/tr '\n' ' ')"; fi
+          fi
+          # gh leaves its config dir empty at most; anything inside (config.yml, hosts.yml, extensions) is planted
+          for d in "${XDG_CONFIG_HOME:-/nonexistent}/gh" "${HOME:-/nonexistent}/.config/gh"; do
+            if [ -d "$d" ] && [ -n "$(/usr/bin/find "$d" -mindepth 1 -print -quit 2> /dev/null)" ]; then bad "a gh config exists: $d"; fi
+          done
+          for v in NODE_OPTIONS BASH_ENV ENV LD_PRELOAD LD_LIBRARY_PATH PYTHONHOME PYTHONPATH PYTHONSTARTUP; do
+            if [ -n "${!v+x}" ]; then bad "$v is set"; fi
+          done
+          if [ "${PYTHONNOUSERSITE:-}" != 1 ]; then bad "PYTHONNOUSERSITE is not 1"; fi
+          # every exported variable, by name (bash's own list: no external command prints the environment)
+          for k in $(compgen -e); do
+            case "$k" in RUNNER_TOOL_CACHE | AGENT_TOOLSDIRECTORY | PATH) continue ;; esac
+            v=${!k}
+            case "$v" in *"$cache"/* | "$cache") bad "$k points into the cache: $v" ;; esac
+          done
+          echo "runner cache guard: HOME=$HOME RUNNER_TEMP=$tmp"
+          echo "runner cache guard: PATH=$PATH"
+          if [ "$fail" = 0 ]; then echo "runner cache guard: ok, nothing from the runner's cache"; fi
+          exit "$fail"
       # gitleaks-action@v2 requires a paid GITLEAKS_LICENSE for ORG repos. When the
       # license secret is present, use the action (richer reporting). Otherwise fall
       # back to the free open-source gitleaks binary so secret scanning still runs.
@@ -142,7 +248,6 @@ jobs:
       # before anything is extracted; a scan with no verified binary stops here with one clear line.
       - name: gitleaks (install pinned binary)
         if: ${{ env.GITLEAKS_LICENSE == '' }}
-        shell: bash
         # Every network phase has a hard cap, so this step ends inside the job's timeout even when github.com HANGS
         # instead of answering 504 (2026-11-08: a hung curl held a job to its 5-minute limit and the REST API fallback
         # never ran). Worst case with no success at all: 45 + 25 + 45 = 115 s of caps, plus at most 3 x 2 s of kill grace
@@ -206,12 +311,13 @@ jobs:
           echo "gitleaks ${VERSION}: installed from the ${SRC}, sha256 verified"
       - name: gitleaks (free binary fallback)
         if: ${{ env.GITLEAKS_LICENSE == '' }}
-        shell: bash
         env:
           EVENT: ${{ github.event_name }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          # only pull_request_target fetches (its checkout is the BASE repository); see the fetch below
+          READ_TOKEN: ${{ github.event_name == 'pull_request_target' && github.token || '' }}
           PUSH_BEFORE: ${{ github.event.before }}
           PUSH_AFTER: ${{ github.sha }}
           MG_BASE: ${{ github.event.merge_group.base_sha }}
@@ -235,7 +341,18 @@ jobs:
             pull_request|pull_request_target)
               # pull_request_target checks out the BASE repository: a fork's head commit is not in it.
               if [ -n "$PR_HEAD" ] && ! have "$PR_HEAD" && [ -n "$PR_NUMBER" ]; then
-                git fetch --no-tags --quiet origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/origin/pr-head" || true
+                # the checkout keeps no credentials (persist-credentials: false, T-11229): the job token reaches this ONE git
+                # process through its environment, never an argument and never a file. printf is a builtin: no argv holds it.
+                if [ -n "${READ_TOKEN:-}" ]; then
+                  basic=$(printf 'x-access-token:%s' "$READ_TOKEN" | base64 -w0)
+                  echo "::add-mask::$basic"
+                  GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+                    GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $basic" \
+                    git fetch --no-tags --quiet origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/origin/pr-head" || true
+                  unset basic
+                else
+                  git fetch --no-tags --quiet origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/origin/pr-head" || true
+                fi
               fi
               if [ -n "$PR_BASE" ] && [ -n "$PR_HEAD" ] && have "$PR_BASE" && have "$PR_HEAD"; then
                 RANGE="${PR_BASE}..${PR_HEAD}"
@@ -266,6 +383,8 @@ jobs:
                 echo "::warning::gitleaks: merge group range ${MG_BASE:0:12}..${MG_HEAD:0:12} not available in this clone; scanning the full history"
               fi ;;
           esac
+          # the token was for the fetch only: the scan binary below never sees it
+          unset READ_TOKEN
           args=(detect --source . --redact --no-banner --exit-code 0 --report-format sarif --report-path gitleaks.sarif)
           IS_PR=0; case "$EVENT" in pull_request|pull_request_target|merge_group) IS_PR=1 ;; esac
           # The allowlist of a pull request comes from its BASE, never its head: a PR that adds a secret could otherwise
@@ -344,7 +463,6 @@ jobs:
       # (${VAR}). A pull request FAILS only for a literal it ADDS (a JSON path whose literal value the base does not already
       # hold); literals already on the base are warnings, so a repo that still carries an old one is not turned red.
       - name: mcp config literal secrets
-        shell: bash
         env:
           EVENT: ${{ github.event_name }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
@@ -436,7 +554,6 @@ jobs:
       - name: scope (which advisory scanners this run needs)
         id: scope
         if: ${{ !cancelled() }}
-        shell: bash
         env:
           EVENT: ${{ github.event_name }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
@@ -508,10 +625,117 @@ jobs:
     if: ${{ !cancelled() && needs.gitleaks.outputs.npm_audit != 'false' }}
     runs-on: ${{ (inputs.main_runner != '' && inputs.runner == 'coolify-ci' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) && inputs.main_runner || inputs.runner }}
     timeout-minutes: 5
+    env:
+      PATH: /usr/bin:/bin:/usr/sbin:/sbin
+      PYTHONNOUSERSITE: '1'
+    # T-11229 (G-218): the runner's HOME, its caches and the first directory on PATH sit on a per-runner cache that every
+    # earlier job, of any repo in the org, could write. This job starts from a fresh HOME under RUNNER_TEMP, a fixed PATH
+    # and a shell given by absolute path (the runner resolves a bare `shell: bash` through ITS OWN PATH, which job env
+    # cannot change), and the guard step proves it before anything reads the checkout.
+    # pnpm/action-setup and actions/setup-node below stay as they are in this change: node and pnpm come from the runner's
+    # tool cache by design, so the guard runs before them (T-11229 second part).
+    defaults:
+      run:
+        shell: /usr/bin/bash --noprofile --norc -eo pipefail {0}
     steps:
+      - name: isolate (fresh HOME and caches under RUNNER_TEMP, nothing from the runner's cache; T-11229)
+        run: |
+          [ "$PATH" = /usr/bin:/bin:/usr/sbin:/sbin ] || { echo "::error title=runner cache guard::PATH is not the fixed one: $PATH"; exit 1; }
+          d="$RUNNER_TEMP/h"
+          umask 077
+          mkdir -p "$d"/.config "$d"/.cache "$d"/.local/share "$d"/.local/state "$d"/.npm "$d"/.pnpm-store "$d"/.corepack \
+            "$d"/.cargo "$d"/.rustup "$d"/.yarn "$d"/.next-cache "$d"/.pw
+          : > "$d/.gitconfig"
+          {
+            echo "HOME=$d"
+            echo "XDG_CONFIG_HOME=$d/.config"
+            echo "XDG_CACHE_HOME=$d/.cache"
+            echo "XDG_DATA_HOME=$d/.local/share"
+            echo "XDG_STATE_HOME=$d/.local/state"
+            echo "npm_config_cache=$d/.npm"
+            echo "npm_config_store_dir=$d/.pnpm-store"
+            echo "COREPACK_HOME=$d/.corepack"
+            echo "CARGO_HOME=$d/.cargo"
+            echo "RUSTUP_HOME=$d/.rustup"
+            echo "YARN_CACHE_FOLDER=$d/.yarn"
+            echo "NEXT_CACHE_DIR=$d/.next-cache"
+            echo "PLAYWRIGHT_BROWSERS_PATH=$d/.pw"
+            echo "GIT_CONFIG_GLOBAL=$d/.gitconfig"
+          } >> "$GITHUB_ENV"
+          echo "isolate: HOME=$d"
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: runner cache guard (nothing from the runner's cache; the paths it checked are printed)
+        run: |
+          # The runner image points HOME, CARGO_HOME, the npm/pnpm/yarn caches and the tool cache at /gha-cache and puts
+          # /gha-cache/cargo/bin first on PATH. That directory belongs to the runner, not to the job: every job on that runner
+          # writes it and the next job, of ANY repo in the org, reads it. This step proves the isolate step and the job's own
+          # env (PATH, PYTHONNOUSERSITE, shell) took effect, and fails the job before anything reads the checkout when not.
+          # It sets nothing up. Its printed paths are the proof a run shows.
+          set +e -uo pipefail
+          cache=/gha-cache
+          safe=/usr/bin:/bin:/usr/sbin:/sbin
+          fail=0
+          bad() { echo "::error title=runner cache guard::$*"; fail=1; }
+          # under <path> <dir>: the path is the dir or lies below it
+          under() { case "$1/" in "$2"/*) return 0 ;; esac; return 1; }
+          # RUNNER_TOOL_CACHE and AGENT_TOOLSDIRECTORY are the runner's own and GITHUB_ENV cannot change them: a tool that
+          # resolves there is as bad as one under /gha-cache
+          in_cache() {
+            under "$1" "$cache" && return 0
+            [ -n "${RUNNER_TOOL_CACHE:-}" ] && under "$1" "$RUNNER_TOOL_CACHE" && return 0
+            [ -n "${AGENT_TOOLSDIRECTORY:-}" ] && under "$1" "$AGENT_TOOLSDIRECTORY" && return 0
+            return 1
+          }
+          tmp=${RUNNER_TEMP:-}
+          if [ -z "$tmp" ] || [ ! -d "$tmp" ]; then
+            bad "RUNNER_TEMP is not a directory (${tmp:-unset})"
+            tmp=/nonexistent-runner-temp
+          fi
+          for v in HOME XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME XDG_STATE_HOME npm_config_cache npm_config_store_dir COREPACK_HOME; do
+            val=${!v:-}
+            if [ -z "$val" ]; then bad "$v is not set: the isolate step did not run"
+            elif ! under "$val" "$tmp"; then bad "$v=$val is not under RUNNER_TEMP ($tmp)"
+            fi
+          done
+          if [ "$PATH" != "$safe" ]; then bad "PATH is not the image's own dirs: PATH=$PATH (want $safe)"; fi
+          # a tool the image does not carry is not a hole; one that is there must resolve (symlinks followed) outside the cache
+          for t in bash git gh python3 node jq curl; do
+            if ! p=$(command -v "$t"); then
+              if [ "$t" = bash ]; then bad "bash is not on PATH"; else echo "runner cache guard: $t: not on PATH"; fi
+              continue
+            fi
+            r=$(/usr/bin/readlink -f "$p")
+            echo "runner cache guard: $t: $p -> $r"
+            if in_cache "$p" || in_cache "$r"; then bad "$t resolves into the runner's cache: $p -> $r"; fi
+          done
+          # the global git config: only safe.directory (what actions/checkout adds), and the file is HOME's own
+          if [ -n "${GIT_CONFIG_GLOBAL:-}" ] && [ "$GIT_CONFIG_GLOBAL" != "${HOME:-}/.gitconfig" ]; then
+            bad "GIT_CONFIG_GLOBAL=$GIT_CONFIG_GLOBAL is not HOME's own .gitconfig"
+          fi
+          if command -v git > /dev/null 2>&1; then
+            keys=$(git config --global --name-only --list 2> /dev/null | /usr/bin/sort -u | /usr/bin/grep -v -x 'safe.directory' || true)
+            if [ -n "$keys" ]; then bad "the global git config holds more than safe.directory: $(echo "$keys" | /usr/bin/tr '\n' ' ')"; fi
+          fi
+          # gh leaves its config dir empty at most; anything inside (config.yml, hosts.yml, extensions) is planted
+          for d in "${XDG_CONFIG_HOME:-/nonexistent}/gh" "${HOME:-/nonexistent}/.config/gh"; do
+            if [ -d "$d" ] && [ -n "$(/usr/bin/find "$d" -mindepth 1 -print -quit 2> /dev/null)" ]; then bad "a gh config exists: $d"; fi
+          done
+          for v in NODE_OPTIONS BASH_ENV ENV LD_PRELOAD LD_LIBRARY_PATH PYTHONHOME PYTHONPATH PYTHONSTARTUP; do
+            if [ -n "${!v+x}" ]; then bad "$v is set"; fi
+          done
+          if [ "${PYTHONNOUSERSITE:-}" != 1 ]; then bad "PYTHONNOUSERSITE is not 1"; fi
+          # every exported variable, by name (bash's own list: no external command prints the environment)
+          for k in $(compgen -e); do
+            case "$k" in RUNNER_TOOL_CACHE | AGENT_TOOLSDIRECTORY | PATH) continue ;; esac
+            v=${!k}
+            case "$v" in *"$cache"/* | "$cache") bad "$k points into the cache: $v" ;; esac
+          done
+          echo "runner cache guard: HOME=$HOME RUNNER_TEMP=$tmp"
+          echo "runner cache guard: PATH=$PATH"
+          if [ "$fail" = 0 ]; then echo "runner cache guard: ok, nothing from the runner's cache"; fi
+          exit "$fail"
       # 2026-07-28: not every consuming repo uses pnpm (e.g. liveagent-ai is
       # plain npm/package-lock.json). pnpm/action-setup hard-fails on a repo
       # with no packageManager field and no pnpm-lock.yaml -- that failure
@@ -519,7 +743,6 @@ jobs:
       # the package-manager choice has to be made up front.
       - name: Detect package manager
         id: pkgmgr
-        shell: bash
         # 2026-09-24: a pnpm-lock.yaml alone is not proof the repo uses pnpm. dsh-plugins
         # carries both lockfiles, installs with `npm ci`, and has no packageManager field,
         # so pnpm/action-setup died with "No pnpm version is specified". Order:
@@ -550,7 +773,6 @@ jobs:
       # workspace the lockfile's importers carry every package, so the report is the same (checked on adnexus-ai).
       - name: Keep the PR's npm config out of the audit
         id: npmcfg
-        shell: bash
         env:
           PNPM_PIN: "10.33.0"
         run: |
@@ -595,7 +817,6 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: "22" }
       - name: Audit (findings are advisory; an audit that did not run fails)
-        shell: bash
         run: |
           # GitHub runs `shell: bash` as `bash -e -o pipefail`, and npm/pnpm audit exit non-zero whenever they FIND
           # something: with -e on, any finding killed this step before a line was printed (liveagent-ai, run 41096880034).
@@ -668,13 +889,116 @@ jobs:
       TRIVY_SHA256_X64: "c7cbe3137fb8a48a17574bede3dd6beb16742d1e9772929940fc90082c39d9c0"
       TRIVY_SHA256_ARM64: "e174dff2a6dba5e3ae41f8d0537a6324405bd08132497340304c6b20e0f16a1f"
       TRIVY_BLOCKING: ${{ inputs.trivy_blocking }}
+      PATH: /usr/bin:/bin:/usr/sbin:/sbin
+      PYTHONNOUSERSITE: '1'
+    # T-11229 (G-218): the runner's HOME, its caches and the first directory on PATH sit on a per-runner cache that every
+    # earlier job, of any repo in the org, could write. This job starts from a fresh HOME under RUNNER_TEMP, a fixed PATH
+    # and a shell given by absolute path (the runner resolves a bare `shell: bash` through ITS OWN PATH, which job env
+    # cannot change), and the guard step proves it before anything reads the checkout.
+    defaults:
+      run:
+        shell: /usr/bin/bash --noprofile --norc -eo pipefail {0}
     steps:
+      - name: isolate (fresh HOME and caches under RUNNER_TEMP, nothing from the runner's cache; T-11229)
+        run: |
+          [ "$PATH" = /usr/bin:/bin:/usr/sbin:/sbin ] || { echo "::error title=runner cache guard::PATH is not the fixed one: $PATH"; exit 1; }
+          d="$RUNNER_TEMP/h"
+          umask 077
+          mkdir -p "$d"/.config "$d"/.cache "$d"/.local/share "$d"/.local/state "$d"/.npm "$d"/.pnpm-store "$d"/.corepack \
+            "$d"/.cargo "$d"/.rustup "$d"/.yarn "$d"/.next-cache "$d"/.pw
+          : > "$d/.gitconfig"
+          {
+            echo "HOME=$d"
+            echo "XDG_CONFIG_HOME=$d/.config"
+            echo "XDG_CACHE_HOME=$d/.cache"
+            echo "XDG_DATA_HOME=$d/.local/share"
+            echo "XDG_STATE_HOME=$d/.local/state"
+            echo "npm_config_cache=$d/.npm"
+            echo "npm_config_store_dir=$d/.pnpm-store"
+            echo "COREPACK_HOME=$d/.corepack"
+            echo "CARGO_HOME=$d/.cargo"
+            echo "RUSTUP_HOME=$d/.rustup"
+            echo "YARN_CACHE_FOLDER=$d/.yarn"
+            echo "NEXT_CACHE_DIR=$d/.next-cache"
+            echo "PLAYWRIGHT_BROWSERS_PATH=$d/.pw"
+            echo "GIT_CONFIG_GLOBAL=$d/.gitconfig"
+          } >> "$GITHUB_ENV"
+          echo "isolate: HOME=$d"
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: runner cache guard (nothing from the runner's cache; the paths it checked are printed)
+        run: |
+          # The runner image points HOME, CARGO_HOME, the npm/pnpm/yarn caches and the tool cache at /gha-cache and puts
+          # /gha-cache/cargo/bin first on PATH. That directory belongs to the runner, not to the job: every job on that runner
+          # writes it and the next job, of ANY repo in the org, reads it. This step proves the isolate step and the job's own
+          # env (PATH, PYTHONNOUSERSITE, shell) took effect, and fails the job before anything reads the checkout when not.
+          # It sets nothing up. Its printed paths are the proof a run shows.
+          set +e -uo pipefail
+          cache=/gha-cache
+          safe=/usr/bin:/bin:/usr/sbin:/sbin
+          fail=0
+          bad() { echo "::error title=runner cache guard::$*"; fail=1; }
+          # under <path> <dir>: the path is the dir or lies below it
+          under() { case "$1/" in "$2"/*) return 0 ;; esac; return 1; }
+          # RUNNER_TOOL_CACHE and AGENT_TOOLSDIRECTORY are the runner's own and GITHUB_ENV cannot change them: a tool that
+          # resolves there is as bad as one under /gha-cache
+          in_cache() {
+            under "$1" "$cache" && return 0
+            [ -n "${RUNNER_TOOL_CACHE:-}" ] && under "$1" "$RUNNER_TOOL_CACHE" && return 0
+            [ -n "${AGENT_TOOLSDIRECTORY:-}" ] && under "$1" "$AGENT_TOOLSDIRECTORY" && return 0
+            return 1
+          }
+          tmp=${RUNNER_TEMP:-}
+          if [ -z "$tmp" ] || [ ! -d "$tmp" ]; then
+            bad "RUNNER_TEMP is not a directory (${tmp:-unset})"
+            tmp=/nonexistent-runner-temp
+          fi
+          for v in HOME XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME XDG_STATE_HOME npm_config_cache npm_config_store_dir COREPACK_HOME; do
+            val=${!v:-}
+            if [ -z "$val" ]; then bad "$v is not set: the isolate step did not run"
+            elif ! under "$val" "$tmp"; then bad "$v=$val is not under RUNNER_TEMP ($tmp)"
+            fi
+          done
+          if [ "$PATH" != "$safe" ]; then bad "PATH is not the image's own dirs: PATH=$PATH (want $safe)"; fi
+          # a tool the image does not carry is not a hole; one that is there must resolve (symlinks followed) outside the cache
+          for t in bash git gh python3 node jq curl; do
+            if ! p=$(command -v "$t"); then
+              if [ "$t" = bash ]; then bad "bash is not on PATH"; else echo "runner cache guard: $t: not on PATH"; fi
+              continue
+            fi
+            r=$(/usr/bin/readlink -f "$p")
+            echo "runner cache guard: $t: $p -> $r"
+            if in_cache "$p" || in_cache "$r"; then bad "$t resolves into the runner's cache: $p -> $r"; fi
+          done
+          # the global git config: only safe.directory (what actions/checkout adds), and the file is HOME's own
+          if [ -n "${GIT_CONFIG_GLOBAL:-}" ] && [ "$GIT_CONFIG_GLOBAL" != "${HOME:-}/.gitconfig" ]; then
+            bad "GIT_CONFIG_GLOBAL=$GIT_CONFIG_GLOBAL is not HOME's own .gitconfig"
+          fi
+          if command -v git > /dev/null 2>&1; then
+            keys=$(git config --global --name-only --list 2> /dev/null | /usr/bin/sort -u | /usr/bin/grep -v -x 'safe.directory' || true)
+            if [ -n "$keys" ]; then bad "the global git config holds more than safe.directory: $(echo "$keys" | /usr/bin/tr '\n' ' ')"; fi
+          fi
+          # gh leaves its config dir empty at most; anything inside (config.yml, hosts.yml, extensions) is planted
+          for d in "${XDG_CONFIG_HOME:-/nonexistent}/gh" "${HOME:-/nonexistent}/.config/gh"; do
+            if [ -d "$d" ] && [ -n "$(/usr/bin/find "$d" -mindepth 1 -print -quit 2> /dev/null)" ]; then bad "a gh config exists: $d"; fi
+          done
+          for v in NODE_OPTIONS BASH_ENV ENV LD_PRELOAD LD_LIBRARY_PATH PYTHONHOME PYTHONPATH PYTHONSTARTUP; do
+            if [ -n "${!v+x}" ]; then bad "$v is set"; fi
+          done
+          if [ "${PYTHONNOUSERSITE:-}" != 1 ]; then bad "PYTHONNOUSERSITE is not 1"; fi
+          # every exported variable, by name (bash's own list: no external command prints the environment)
+          for k in $(compgen -e); do
+            case "$k" in RUNNER_TOOL_CACHE | AGENT_TOOLSDIRECTORY | PATH) continue ;; esac
+            v=${!k}
+            case "$v" in *"$cache"/* | "$cache") bad "$k points into the cache: $v" ;; esac
+          done
+          echo "runner cache guard: HOME=$HOME RUNNER_TEMP=$tmp"
+          echo "runner cache guard: PATH=$PATH"
+          if [ "$fail" = 0 ]; then echo "runner cache guard: ok, nothing from the runner's cache"; fi
+          exit "$fail"
       - name: trivy fs (vuln, secret, misconfig — HIGH/CRITICAL)
         id: scan
-        shell: bash
         run: |
           # No `set -e`: every failure is captured into STATUS so advisory mode can never go red.
           set -uo pipefail
@@ -693,7 +1017,12 @@ jobs:
           # `timeout` bounds the whole curl call including curl's own retries (up to 3 tries of 30 s, 2 s apart): 90 s, plus
           # at most 2 s of kill grace = 92 s. The asset is 52.7 MB (x64) / 47.4 MB (arm64), so 30 s a try needs about
           # 14 Mbit/s. The job timeout below covers this, the scan's own 8-minute --timeout, checkout and reporting.
-          TRIVY="$(command -v trivy || true)"
+          # The image's own trivy by absolute path (PATH is fixed to /usr/bin:/bin:/usr/sbin:/sbin in this job, T-11229, so a
+          # bare `command -v` no longer finds /usr/local/bin and a binary on a cache dir can never be picked up).
+          TRIVY=""
+          for cand in /usr/local/bin/trivy /usr/bin/trivy; do
+            if [ -x "$cand" ]; then TRIVY="$cand"; break; fi
+          done
           if [ -z "$TRIVY" ]; then
             case "$(uname -m)" in
               x86_64)        ASSET=Linux-64bit; SHA="$TRIVY_SHA256_X64" ;;
@@ -825,7 +1154,6 @@ jobs:
           retention-days: 3
       - name: Enforce (only when trivy_blocking is true)
         if: ${{ inputs.trivy_blocking }}
-        shell: bash
         env:
           STATUS: ${{ steps.scan.outputs.status }}
           TOTAL: ${{ steps.scan.outputs.total }}
