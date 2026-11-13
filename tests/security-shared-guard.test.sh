@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Offline test for the isolation of the gitleaks, npm-audit and trivy jobs of .github/workflows/security-shared.yml (T-11229):
+# Offline test for the isolation of the gitleaks, npm-audit, trivy, codeql and zap-baseline jobs of .github/workflows/security-shared.yml
+# (T-11229; T-11386 added codeql, zap-baseline, npm-audit's pinned node + tool guard and the licensed gitleaks path):
 # each job's first step isolates HOME, the XDG dirs and the tool caches under RUNNER_TEMP, the job env fixes PATH, and a guard step
 # fails the job when the runner's cache can still reach it. Part 1 checks the shape of the three jobs and proves the same checks flag the
 # workflow as it was before (tests/fixtures/security-shared.before-t11229.yml) and four mutations of the new one. Part 2 runs the isolate
