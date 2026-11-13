@@ -8,6 +8,9 @@
 #    the org enables the corresponding paid/repo-level features.
 #  - gitleaks is REPORT-ONLY until `gitleaks_blocking: true` (T-3698): then a pull request whose own commits
 #    add a secret outside the allowlist fails, and an unscanned PR fails closed. Full-history scans never block.
+#    A scheduled or manual scan of the free gitleaks binary (no GITLEAKS_LICENSE) that could NOT complete (killed, memory
+#    watchdog, error, no report) fails the job with "gitleaks scan incomplete" (T-11668): findings stay report-only, an
+#    unscanned week is never green. The licensed action's path keeps its own behaviour.
 #  - trivy (HIGH/CRITICAL) is ADVISORY on first rollout: counts go to the job summary,
 #    the JSON+SARIF report to the `trivy-report` artifact, and the check stays green.
 #    A repo opts into failing with `trivy_blocking: true`. It scans only the repo's own
@@ -66,6 +69,18 @@ on:
           `kf-gitleaks-count` log line, and the check stays green. It becomes the default after one week of counts.
           Scheduled / manual full-history scans and pushes never fail on findings (old history is triaged, not
           blocked).
+      gitleaks_weekly_window:
+        type: boolean
+        default: false
+        description: >
+          Default false: every scheduled gitleaks scan reads the full history of every ref, as it always did. True is
+          meant ONLY for a repository whose full-history scan does not fit the job's memory (kluczesoft-pl, 2026-11-09,
+          T-11668): a scheduled run on day 8-31 of the month then reads only the commits of every ref COMMITTED in the
+          last 8 days (git's --since, the committer date); the first scheduled run of a month (day 1-7) and every manual
+          run still read the full history. The price: a commit whose committer date is more than 8 days old when it is
+          pushed (a local commit pushed late, or a backdated committer date), on a branch that no pull-request or push
+          scan reads, is seen only by the next day 1-7 run, and never when the branch is gone by then. A dropped weekly
+          run leaves its days to that run too.
       trivy_blocking:
         type: boolean
         default: false
@@ -105,7 +120,9 @@ jobs:
   gitleaks:
     runs-on: ${{ (inputs.main_runner != '' && inputs.runner == 'coolify-ci' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) && inputs.main_runner || inputs.runner }}
     # A pull request / push scans only its own commits and finishes in seconds; the full-history scan
-    # is the scheduled / manual run, which needs longer on large histories (kluczesoft-pl, 41k files).
+    # is the scheduled / manual run, which needs longer on large histories (kluczesoft-pl, 41k files). A caller that sets
+    # gitleaks_weekly_window scans in full only on the manual run and the first scheduled run of each month; its other
+    # scheduled runs scan the commits of every ref committed (committer date) in the last 8 days (T-11668).
     # Pull request / push: 8 min = the 5 min that covered checkout and scan, plus the install step's 121 s worst case
     # (its caps are summed in that step) and slack, so a hung download cannot starve the scan.
     timeout-minutes: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 30 || 8 }}
@@ -325,10 +342,12 @@ jobs:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           GITLEAKS_BLOCKING: ${{ inputs.gitleaks_blocking }}
           REPO: ${{ github.repository }}
+          WEEKLY_WINDOW: ${{ inputs.gitleaks_weekly_window }}
         run: |
           # The pinned, sha256-verified binary was installed at /tmp/gitleaks by the step above.
           # Scope (2026-09-27): a pull request scans exactly its own commits (base..head) and a push the
-          # pushed range; only the scheduled / manual run scans the whole history. Scanning the full
+          # pushed range; only the scheduled / manual run scans the whole history (with gitleaks_weekly_window: the manual
+          # run and the first scheduled run of a month; see the schedule arm). Scanning the full
           # history on every PR timed out at 5 min on kluczesoft-pl and turned this advisory check red.
           # A new-branch push (before = 000…) scans what the default branch does not already have; a
           # force-push whose `before` is gone falls back to the pushed head commit alone.
@@ -382,6 +401,15 @@ jobs:
               else
                 echo "::warning::gitleaks: merge group range ${MG_BASE:0:12}..${MG_HEAD:0:12} not available in this clone; scanning the full history"
               fi ;;
+            schedule)
+              # T-11668: only with gitleaks_weekly_window true (opt-in; default false = the full history, as always), the
+              # run on day 8-31 scans the commits of EVERY ref committed (committer date, git's --since) in the last 8 days
+              # (one day of overlap); the first scheduled run of a month (day 1-7) scans the full history. On kluczesoft-pl
+              # the weekly full-history scan (6,566 commits of every ref on 2026-11-09, one branch commit adding 3.0 M lines)
+              # passed the job container's memory limit and was killed every time it reached that commit. Manual runs stay
+              # full. The price of the window is in the input's description.
+              day=$(date -u +%d)
+              if [ "${WEEKLY_WINDOW:-false}" = true ] && [ "$((10#$day))" -gt 7 ]; then RANGE="--all --since=8.days.ago"; fi ;;
           esac
           # the token was for the fetch only: the scan binary below never sees it
           unset READ_TOKEN
@@ -409,8 +437,35 @@ jobs:
           fi
           # --exit-code 0: a finding never makes gitleaks itself fail, so a non-zero exit is an ERROR (bad range, no
           # binary, unreadable repo) and is told apart from "found something". The decision is made below.
+          # Memory (T-11668): gitleaks holds what it reads of `git log -p`; on 2026-11-09 the kluczesoft-pl full-history scan
+          # passed the job container's memory limit and the kernel killed it (exit 137) with no line saying why. A watchdog
+          # stops it at 3/4 of this container's own limit (cgroup v2 memory.max, else v1 memory.limit_in_bytes; 4096 MB when
+          # neither reads as a number under 1 TiB) and says so; GOMEMLIMIT at 80 % of that makes Go's GC work first.
+          # Both apply to scheduled and manual runs only (WATCH=1): a pull-request, push or merge-group scan runs as before.
+          # The watchdog reads gitleaks' own RSS; the `git log -p` it starts counts against the same limit, so the kernel can
+          # still kill first (then the reason reads "killed, signal 9", and a scheduled or manual run fails all the same).
+          WATCH=0; case "$EVENT" in schedule|workflow_dispatch) WATCH=1 ;; esac
+          CAP_MB=4096
+          for f in /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory/memory.limit_in_bytes; do
+            lim=$(cat "$f" 2>/dev/null || true)
+            if [[ "$lim" =~ ^[0-9]+$ ]] && [ "$lim" -lt 1099511627776 ]; then CAP_MB=$((lim / 1048576 * 3 / 4)); break; fi
+          done
+          CAPPED=0
           rc=0
-          /tmp/gitleaks "${args[@]}" || rc=$?
+          if [ "$WATCH" = 1 ]; then export GOMEMLIMIT="$((CAP_MB * 8 / 10))MiB"; fi
+          /tmp/gitleaks "${args[@]}" &
+          pid=$!
+          while [ "$WATCH" = 1 ] && kill -0 "$pid" 2>/dev/null; do
+            rss=$(awk '/^VmRSS:/ { print $2 }' "/proc/$pid/status" 2>/dev/null || true)
+            if [ -n "$rss" ] && [ "$rss" -gt $((CAP_MB * 1024)) ]; then
+              echo "gitleaks: passed ${CAP_MB} MB RSS ($((rss / 1024)) MB); stopped by the memory watchdog"
+              CAPPED=1
+              kill -KILL "$pid" 2>/dev/null || true
+              break
+            fi
+            sleep 0.5
+          done
+          wait "$pid" || rc=$?
           if [ "$IS_PR" = 1 ]; then
             for f in .gitleaks.toml .gitleaksignore; do if [ -e "$ASIDE/$f" ]; then mv "$ASIDE/$f" "$f"; fi; done
           fi
@@ -425,9 +480,23 @@ jobs:
             echo "- mode: ${MODE}"
           } >> "$GITHUB_STEP_SUMMARY"
           if [ "$rc" -ne 0 ] || [ -z "$COUNT" ]; then
-            msg="gitleaks did not complete (exit ${rc}, report ${COUNT:+read}${COUNT:-missing}): this run proves nothing about secrets"
+            case "$CAPPED:$rc" in
+              1:*) why="stopped by the memory watchdog at ${CAP_MB} MB" ;;
+              0:137) why="killed, signal 9 (the container's memory limit or the runner)" ;;
+              0:143) why="terminated, signal 15 (timeout or cancel)" ;;
+              *) why="exit ${rc}" ;;
+            esac
+            msg="gitleaks did not complete (${why}; report ${COUNT:+read}${COUNT:-missing}): this run proves nothing about secrets"
             # a pull request in blocking mode fails closed: an unscanned PR is never green
             if [ "$IS_PR" = 1 ] && [ "$MODE" = blocking ]; then echo "::error::$msg"; exit 1; fi
+            # T-11668: a scheduled or manual scan that could not complete is a FAILED scan, not a clean one. The step ends
+            # green so the MCP literal scan and the scope step still run; the job's last step fails on this flag.
+            case "$EVENT" in
+              schedule|workflow_dispatch)
+                echo "::error title=gitleaks scan incomplete::$msg"
+                if [ -n "${GITHUB_ENV:-}" ]; then echo "GITLEAKS_INCOMPLETE=${why}" >> "$GITHUB_ENV"; else exit 1; fi
+                exit 0 ;;
+            esac
             echo "::warning::$msg"; exit 0
           fi
           echo "gitleaks: $COUNT potential finding(s)"
@@ -618,6 +687,15 @@ jobs:
             echo "- trivy: $([ "$trivy" = true ] && echo runs || echo "skipped (no dependency, container or IaC file changed)")"
             echo "- why: ${why}"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # T-11668: the gitleaks step sets GITLEAKS_INCOMPLETE when a scheduled or manual scan could not complete (killed,
+      # memory watchdog, error, no report). It ends green so the MCP literal scan and the scope step above still run; this
+      # last step turns the flag into a failed job, named for what happened, instead of a green week that scanned nothing.
+      - name: gitleaks scan incomplete (a scheduled or manual scan that did not finish fails the job)
+        if: ${{ !cancelled() && env.GITLEAKS_INCOMPLETE != '' }}
+        run: |
+          echo "gitleaks scan incomplete: ${GITLEAKS_INCOMPLETE}. This run proves nothing about secrets; see the gitleaks step's log."
+          exit 1
 
   npm-audit:
     needs: gitleaks
