@@ -1311,3 +1311,8 @@ jobs:
         continue-on-error: true
         with:
           category: "/language:${{ inputs.language }}"
+          # Without these CodeQL sizes its heap and thread count from the HOST, not the job: on a beast lane runner
+          # that is the 125 GiB host, and one run held 11 GiB of Java in swap on 2026-11-16 06:46Z while beast was out
+          # of memory (INFRA-BASE-BV3 memory table). Cap at 4 GiB and 2 threads (brainv3 07:18Z, T-13824).
+          ram: 4096
+          threads: 2
