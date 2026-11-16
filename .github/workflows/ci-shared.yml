@@ -76,6 +76,9 @@ jobs:
       # Raise V8 heap so `tsc --noEmit` / eslint don't SIGABRT (exit 134, OOM)
       # on large codebases. ubuntu-latest has ~16GB RAM; 6GB leaves headroom.
       NODE_OPTIONS: --max-old-space-size=6144
+      # Vitest 4 starts os.availableParallelism() workers. A coolify-ci runner container sees all 96 host cores (cpuset
+      # 0-95) under a 4-core quota and 10 GiB, so a test run forked about 95 workers. Cap at the quota (T-13824, 16.11).
+      VITEST_MAX_WORKERS: "4"
     steps:
       - uses: actions/checkout@v4
 
