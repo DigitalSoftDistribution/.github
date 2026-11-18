@@ -35,16 +35,33 @@ on:
           green PR of the repo until main's run settles: 92 green PRs waited with 0 merges a round. `coolify-ci-main`
           is the beast main lane (gha-runner-main@21..28, beast-infra ci/install-lanes.sh): a pull-request job asking
           for `coolify-ci` reaches only the lane runners lent to the shared pool (/etc/beast-ci/lanes-shared).
-          Schedule / workflow_dispatch / pull_request runs stay on `runner`.
+          Schedule / workflow_dispatch / pull_request runs stay on `runner`; merge_group runs follow `mq_runner`.
+      mq_runner:
+        type: string
+        default: ""
+        description: >
+          runs-on label for a MERGE QUEUE run (event merge_group), used only while `runner` is the plain shared pool
+          (`coolify-ci`); a caller that names any other runner keeps it. "" (the default) takes the configuration variable
+          CI_MQ_RUNNER instead. In a called workflow `vars` are the CALLER repository's (repository or organisation level;
+          GitHub docs, Variables: "For reusable workflows, the variables from the caller workflow's repository are used"),
+          so a repo or the org opts in by setting CI_MQ_RUNNER, with no caller change. When both are empty the run stays on
+          `runner`, so no merge group waits on a label nobody named. One label, a merge-queue pool such as coolify-ci-mq.
+          A trusted lane (any label containing coolify-ci-main, coolify-ci-deploy or coolify-ci-hotfix) is never used:
+          those runners hold deploy rights and merge-group code is not on main yet. Such a value keeps the job on `runner`
+          and fails it in its first step, before checkout (the same lanes beast-infra's ci-vars refuses).
+          Why (G-218 T-13997, 2026-11-17): merge_group jobs waited behind pull-request jobs on `coolify-ci` while merges
+          stopped; beast runners reserved for merge groups carry the label coolify-ci-mq.
       skip_heavy_on_draft:
         type: boolean
-        default: false
+        default: true
         description: >
           On a DRAFT pull request, skip the heavy jobs (they report "skipped"); they run when the PR is marked ready.
-          Turn it on ONLY in the same change that adds `ready_for_review` to the caller's `pull_request` types: without
-          that trigger, marking a PR ready starts no new run and the draft's skipped checks would be its latest.
+          This needs `ready_for_review` in the caller's `pull_request` types: without that trigger, marking a PR ready
+          starts no new run and the draft's skipped checks would be its latest. A caller without it passes false.
           Why (G-218 CI stall, 2026-10-27): 117 of 217 queued beast-infra PR runs were on drafts while ready PRs waited
-          50+ minutes for a runner.
+          50+ minutes for a runner. Default true since 2026-11-17 (T-13997): all 11 callers of this workflow in the org
+          (read 17.11) list ready_for_review and none passed this input, so none needed a change; a new caller must list
+          ready_for_review or pass false.
       allow-scratch-paths:
         description: "Set to true only for a repo that tracks a scratch / probe / output tree on purpose (the scratch guard is then off)"
         type: boolean
@@ -63,7 +80,25 @@ jobs:
 
   ci:
     if: ${{ !(inputs.skip_heavy_on_draft && github.event.pull_request.draft) }}
-    runs-on: ${{ (inputs.main_runner != '' && inputs.runner == 'coolify-ci' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) && inputs.main_runner || inputs.runner }}
+    # Runner: a push to the default branch goes to main_runner and a merge group to mq_runner / vars.CI_MQ_RUNNER (never a
+    # trusted lane: see the guard step), both only while `runner` is the plain pool; every other run stays on `runner`.
+    # The folded lines are ONE expression (same indent, so YAML joins them with single spaces).
+    runs-on: >-
+      ${{ (inputs.main_runner != '' && inputs.runner == 'coolify-ci' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) && inputs.main_runner
+      || (inputs.runner == 'coolify-ci' && github.event_name == 'merge_group' && (inputs.mq_runner || vars.CI_MQ_RUNNER) != ''
+      && !contains(inputs.mq_runner || vars.CI_MQ_RUNNER, 'coolify-ci-main')
+      && !contains(inputs.mq_runner || vars.CI_MQ_RUNNER, 'coolify-ci-deploy')
+      && !contains(inputs.mq_runner || vars.CI_MQ_RUNNER, 'coolify-ci-hotfix')) && (inputs.mq_runner || vars.CI_MQ_RUNNER)
+      || inputs.runner }}
+    # Superseded pull-request runs are cancelled (T-13997): one group per caller workflow, PR and input set, with
+    # cancel-in-progress on pull_request only. Every other event gets a group of its own run (run_id), so a push to main or
+    # a merge group is never grouped with a PR run and never cancelled. Job level: in a called workflow `github.workflow` is
+    # the CALLER's name, and the ci-shared- prefix keeps this group apart from every caller's own workflow-level group
+    # (GitHub docs, reusing workflows: the same group in caller and called workflow cancels the caller). The inputs keep
+    # two calls with different inputs in one caller workflow from cancelling each other.
+    concurrency:
+      group: ci-shared-${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}-${{ inputs.package-manager }}-${{ inputs.node-version }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     # Typecheck + lint + test run serially in this single job with no turbo
     # remote cache, so large monorepos (e.g. keyflow, tracklayer) rebuild
     # upstream packages cold for each phase. History: 10m -> 20m -> 40m. 20m
@@ -80,6 +115,22 @@ jobs:
       # 0-95) under a 4-core quota and 10 GiB, so a test run forked about 95 workers. Cap at the quota (T-13824, 16.11).
       VITEST_MAX_WORKERS: "4"
     steps:
+      # MERGE QUEUE RUNNER GUARD (T-13997): a trusted lane named in mq_runner / vars.CI_MQ_RUNNER fails the merge group
+      # here, on the shared runner the runs-on expression fell back to, before any merge-group code is checked out.
+      - name: Merge queue runner guard
+        if: github.event_name == 'merge_group' && inputs.runner == 'coolify-ci'
+        shell: bash
+        env:
+          MQ_RUNNER: ${{ inputs.mq_runner || vars.CI_MQ_RUNNER }}
+        run: |
+          lc=$(printf '%s' "$MQ_RUNNER" | tr '[:upper:]' '[:lower:]')
+          case "$lc" in
+            *coolify-ci-main*|*coolify-ci-deploy*|*coolify-ci-hotfix*)
+              echo "::error title=Merge queue runner::mq_runner / vars.CI_MQ_RUNNER is '$MQ_RUNNER', a trusted lane (main, deploy, hotfix). Those runners hold deploy rights and merge-group code is not on main yet. Name a merge-queue pool such as coolify-ci-mq, or leave both empty for the shared pool."
+              exit 1 ;;
+          esac
+          echo "merge queue runner: '${MQ_RUNNER:-}' (empty = the shared pool), this job on ${RUNNER_NAME:-unknown}"
+
       - uses: actions/checkout@v4
 
       # SCRATCH GUARD (G-218, 2026-10-26): a PR never ADDS files under an agent's scratch, probe or output tree.
