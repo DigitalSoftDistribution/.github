@@ -18,6 +18,8 @@
 #  - ZAP baseline is opt-in (pass `preview_url`) and never blocks.
 #  - On a pull request, npm-audit and trivy run only when the PR changes what they read (`pr_scope`, default true);
 #    gitleaks and the MCP literal scan run on every PR, and push / schedule / dispatch always scan in full.
+#  - A caller that passes `heavy_on_pull_request: false` skips npm-audit and trivy on EVERY pull request (they report
+#    "skipped"); they then run once, in the merge group and on the push to the default branch.
 name: security-shared
 on:
   workflow_call:
@@ -115,6 +117,20 @@ on:
           Why (G-218 CI CPU, 2026-10-27): 2,000 pull-request security runs in 48 h each started two runner containers
           for a 10-25 s advisory scan whose input the pull request had not touched (over 90 % of them), about 3,700
           container starts on the shared pool. Set false to scan every pull request.
+      heavy_on_pull_request:
+        type: boolean
+        default: true
+        description: >
+          Default true: a pull request runs npm-audit and trivy as pr_scope and skip_heavy_on_draft decide, exactly as
+          before this input existed. A caller that passes false skips both jobs on every pull_request and
+          pull_request_target run through their job-level `if`: they report "skipped", which satisfies a required check
+          (beast-infra requires `security / npm-audit` and `security / trivy`). They then run once per change: in the
+          merge group (scoped by pr_scope, when the repository uses a merge queue) and on the push to the default
+          branch; schedule and workflow_dispatch scan in full as always. gitleaks and the MCP literal scan still run on
+          every pull request. With trivy_blocking: true a trivy finding then fails the merge group or the push, not the
+          pull request.
+          Why (G-218 CI flow, 2026-11-19): beast-infra, dsh-plugins and kf make their pull-request runs light, and the
+          two dependency scanners run once in the merge group or on the push to main instead of on every PR push.
 
 jobs:
   gitleaks:
@@ -633,6 +649,7 @@ jobs:
           DRAFT: ${{ github.event.pull_request.draft }}
           SKIP_DRAFT: ${{ inputs.skip_heavy_on_draft }}
           TRIVY_BLOCKING: ${{ inputs.trivy_blocking }}
+          HEAVY_PR: ${{ inputs.heavy_on_pull_request }}
         run: |
           # What npm-audit reads: the package manifest, the lockfiles and the registry config.
           NPM_RE='(^|/)(package\.json|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|yarn\.lock|\.npmrc)$'
@@ -648,6 +665,11 @@ jobs:
               if [ "$SKIP_DRAFT" = true ] && [ "$DRAFT" = true ]; then
                 npm=false; trivy=false
                 why="a draft pull request: the dependency scanners run when it is marked ready"
+              elif [ "$HEAVY_PR" != true ]; then
+                # heavy_on_pull_request: false. The job-level `if` of npm-audit and trivy skips them on a pull request
+                # on its own; this branch keeps the job summary and the kf-security-scope line true.
+                npm=false; trivy=false
+                why="heavy_on_pull_request is off: the dependency scanners run in the merge group and on the push to the default branch"
               elif [ "$PR_SCOPE" != true ]; then
                 why="pr_scope is off"
               elif ! git cat-file -e "${PR_BASE}^{commit}" 2>/dev/null || ! git cat-file -e "${PR_HEAD}^{commit}" 2>/dev/null; then
@@ -699,8 +721,9 @@ jobs:
 
   npm-audit:
     needs: gitleaks
-    # Skipped (a passing check) only when the scope step said 'false'; see the pr_scope input.
-    if: ${{ !cancelled() && needs.gitleaks.outputs.npm_audit != 'false' }}
+    # Skipped (a passing check) when the scope step said 'false' (see the pr_scope input), and on every pull request when
+    # the caller passes heavy_on_pull_request: false.
+    if: ${{ !cancelled() && needs.gitleaks.outputs.npm_audit != 'false' && (inputs.heavy_on_pull_request || (github.event_name != 'pull_request' && github.event_name != 'pull_request_target')) }}
     runs-on: ${{ (inputs.main_runner != '' && inputs.runner == 'coolify-ci' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) && inputs.main_runner || inputs.runner }}
     timeout-minutes: 5
     env:
@@ -953,8 +976,9 @@ jobs:
     # FAILED on the check (that stalled kwn #1865). The scan step instead always exits 0 and a
     # separate "Enforce" step fails the job only when the caller opted in.
     needs: gitleaks
-    # Skipped (a passing check) only when the scope step said 'false', which it never does with trivy_blocking: true.
-    if: ${{ !cancelled() && needs.gitleaks.outputs.trivy != 'false' }}
+    # Skipped (a passing check) when the scope step said 'false', which it never does with trivy_blocking: true outside
+    # a draft, and on every pull request when the caller passes heavy_on_pull_request: false.
+    if: ${{ !cancelled() && needs.gitleaks.outputs.trivy != 'false' && (inputs.heavy_on_pull_request || (github.event_name != 'pull_request' && github.event_name != 'pull_request_target')) }}
     runs-on: ${{ (inputs.main_runner != '' && inputs.runner == 'coolify-ci' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) && inputs.main_runner || inputs.runner }}
     # 12 min = the install's 92 s worst case (its budget is in the scan step) + the scan's own `--timeout 8m` + checkout, SARIF
     # conversion, summary and report upload, with slack. 10 min left 28 s for all of it after a slow install.

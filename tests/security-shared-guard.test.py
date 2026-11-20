@@ -121,9 +121,14 @@ for job in ("zap-baseline", "codeql"):
 check("gitleaks: needs/outputs/permissions/timeout unchanged",
       [new["jobs"]["gitleaks"].get(k) == old["jobs"]["gitleaks"].get(k) for k in ("outputs", "permissions", "timeout-minutes", "runs-on")],
       [True, True, True, True])
+HEAVY_PR_CLAUSE = "(inputs.heavy_on_pull_request || (github.event_name != 'pull_request' && github.event_name != 'pull_request_target'))"
 for job in ("npm-audit", "trivy"):
-    check(f"{job}: needs/if/runs-on/timeout unchanged",
-          [new["jobs"][job].get(k) == old["jobs"][job].get(k) for k in ("needs", "if", "runs-on", "timeout-minutes")], [True] * 4)
+    check(f"{job}: needs/runs-on/timeout unchanged",
+          [new["jobs"][job].get(k) == old["jobs"][job].get(k) for k in ("needs", "runs-on", "timeout-minutes")], [True] * 3)
+    # heavy_on_pull_request (G-218 CI flow, 2026-11-19) adds one clause to the job-level if; the old condition stays first.
+    old_if = old["jobs"][job]["if"].removeprefix("${{ ").removesuffix(" }}")
+    check(f"{job}: if = the old condition plus only the heavy_on_pull_request clause",
+          new["jobs"][job].get("if"), "${{ " + old_if + " && " + HEAVY_PR_CLAUSE + " }}")
 names = [s.get("uses") for s in new["jobs"]["npm-audit"]["steps"]]
 gi = [i for i, s in enumerate(new["jobs"]["npm-audit"]["steps"]) if str(s.get("name", "")).startswith("runner cache guard")][0]
 check("npm-audit: pnpm/action-setup and setup-node are unchanged and come AFTER the guard",
