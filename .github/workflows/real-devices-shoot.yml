@@ -242,7 +242,9 @@ jobs:
           fi
           if [ -n "$RD_SITE_ARTIFACT" ] && [ -z "$RD_APP" ]; then echo "::error title=real-devices-shoot::site_artifact needs an app preset (cc-demo)"; exit 1; fi
           case "$RD_BASE_IN" in ""|http://*|https://*) ;; *) echo "::error title=real-devices-shoot::base must be an http(s) URL"; exit 1 ;; esac
-          key=$(node -e 'import(process.argv[1]).then((m) => console.log(m.artifactName(process.argv[2])))' "$GITHUB_WORKSPACE/.rds-harness/real-devices-shoot/baseline.mjs" "${RD_APP:-urls}")
+          # The module path and the app go in through the environment, never as arguments: an argument after `node -e` is
+          # process.argv[1], and baseline.mjs would take the import for its own CLI call ("usage: baseline.mjs restore|pack", exit 2).
+          key=$(BASELINE="$GITHUB_WORKSPACE/.rds-harness/real-devices-shoot/baseline.mjs" node -e 'import(process.env.BASELINE).then((m) => console.log(m.artifactName(process.env.RD_APP)))')
           local=false
           if [ -n "$RD_SITE_ARTIFACT" ]; then local=true; fi
           case "$RD_BASE_IN" in http://127.0.0.1*|http://localhost*|https://dev-*.wt.softblaze.net*) local=true ;; esac
