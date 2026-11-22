@@ -119,8 +119,17 @@ print("scope: what this change does not touch")
 for job in ("zap-baseline", "codeql"):
     check(f"{job}: identical to the old file", new["jobs"][job] == old["jobs"][job], True)
 check("gitleaks: needs/outputs/permissions/timeout unchanged",
-      [new["jobs"]["gitleaks"].get(k) == old["jobs"]["gitleaks"].get(k) for k in ("outputs", "permissions", "timeout-minutes", "runs-on")],
-      [True, True, True, True])
+      [new["jobs"]["gitleaks"].get(k) == old["jobs"]["gitleaks"].get(k) for k in ("outputs", "permissions", "timeout-minutes")],
+      [True, True, True])
+# light_runner (G-218 CI flow, 2026-11-21) goes in front of gitleaks' runs-on; the old choice stays whole in the parentheses,
+# so the default "" (falsy) lands on it unchanged. The other jobs never read the input.
+old_ro = old["jobs"]["gitleaks"]["runs-on"].removeprefix("${{ ").removesuffix(" }}")
+check("gitleaks: runs-on = light_runner when set, else the old choice unchanged",
+      new["jobs"]["gitleaks"].get("runs-on"), "${{ inputs.light_runner != '' && inputs.light_runner || (" + old_ro + ") }}")
+# PyYAML reads the `on:` key as the boolean True (YAML 1.1).
+light = new.get(True, new.get("on"))["workflow_call"]["inputs"].get("light_runner", {})
+check("light_runner: a string input whose default is \"\"", [light.get(k) for k in ("type", "default")], ["string", ""])
+check("light_runner: read by the gitleaks job only", [j for j in new["jobs"] if "light_runner" in str(new["jobs"][j])], ["gitleaks"])
 HEAVY_PR_CLAUSE = "(inputs.heavy_on_pull_request || (github.event_name != 'pull_request' && github.event_name != 'pull_request_target'))"
 for job in ("npm-audit", "trivy"):
     check(f"{job}: needs/runs-on/timeout unchanged",
