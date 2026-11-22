@@ -304,3 +304,24 @@ test('report with a refusal and with a broken run sets the verdict and annotatio
   assert.match(fs.readFileSync(path.join(r, 'gho'), 'utf8'), /verdict=fail/);
   assert.equal(execFileSync('node', ['--check', path.join(HERE, '..', 'report.mjs')]).length, 0);
 });
+
+test('the Plan step reads the artifact name without running the baseline CLI', () => {
+  // The step imports baseline.mjs only to call artifactName. A path handed to `node -e` as an argument is process.argv[1]; the
+  // main guard of baseline.mjs then takes the import for a CLI call with the app name as its command, prints
+  // "usage: baseline.mjs restore|pack" and exits 2. Every shoot failed at Plan that way from 2026-10-22 on (beast-infra
+  // real-devices-shoot-cc, 183 runs). So the line is run here exactly as the workflow has it, against a copy of the real module
+  // (a copy, not a link: node resolves a link to its target and the guard would not see the same path).
+  const wf = fs.readFileSync(path.join(HERE, '..', '..', '.github', 'workflows', 'real-devices-shoot.yml'), 'utf8');
+  const lines = wf.split('\n').map((l) => l.trim()).filter((l) => l.startsWith('key=$('));
+  assert.equal(lines.length, 1, 'exactly one line of the workflow sets key');
+  const ws = tmp();
+  fs.mkdirSync(path.join(ws, '.rds-harness', 'real-devices-shoot'), { recursive: true });
+  fs.copyFileSync(path.join(HERE, '..', 'baseline.mjs'), path.join(ws, '.rds-harness', 'real-devices-shoot', 'baseline.mjs'));
+  const plan = (app) => spawnSync('bash', ['-c', `set -euo pipefail\n${lines[0]}\nprintf '%s' "$key"`],
+    { env: { ...process.env, GITHUB_WORKSPACE: ws, RD_APP: app }, encoding: 'utf8' });
+  for (const [app, want] of [['cc-demo', 'real-devices-shoot-cc-demo'], ['', 'real-devices-shoot-urls'], ['a b/c', 'real-devices-shoot-a-b-c']]) {
+    const r = plan(app);
+    assert.equal(r.status, 0, `app ${JSON.stringify(app)}: exit ${r.status}: ${r.stderr.trim()}`);
+    assert.equal(r.stdout, want, `app ${JSON.stringify(app)}`);
+  }
+});
