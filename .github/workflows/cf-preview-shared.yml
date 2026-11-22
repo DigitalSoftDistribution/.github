@@ -1,0 +1,868 @@
+# Reusable workflow: Cloudflare Worker Previews of a pull request head, on the coolify-ci runners only.
+# G-466 OSP-infra 3.1 (T-14303). Design: beast-infra openspec/changes/zephr-inboo-cf-supabase-platform, design.md 3.1
+# (flow), R4 (Worker Previews driven from our own Actions, not Workers Builds), 5 (runners, pinned wrangler, tokens), 6.
+#
+# One run per pull request event of the CALLER, same-repo pull requests only (never a fork):
+#   plan     always, no secret: checks the inputs and picks the database: the PR's own Supabase branch when it touches a
+#            migration path, else the shared `preview` branch, else none (no supabase-project-ref). Writes the plan to
+#            the job summary and to the `plan` output.
+#   preview  deploy true and the PR open: waits for the Supabase branch; for an own branch points the Hyperdrive config
+#            <project>-pr-<N> at it (the shared branch keeps its long-lived <project>-preview config, bound in each
+#            Worker's `previews` block); runs `wrangler preview --name pr-<N>` per Worker; probes each URL (GET path,
+#            MCP initialize + tools/list, the caller's verify command); keeps ONE sticky comment with the URLs, the
+#            database, the CLI artifact, the commit served, the probe results and the DSH attach line, plus a JSON
+#            manifest in an HTML comment for preview_mcp_attach (OSP-infra 3.5).
+#   cleanup  deploy true and the PR closed: `wrangler preview delete --name pr-<N>` per Worker, deletes the Hyperdrive
+#            config <project>-pr-<N>, marks the comment removed. The Supabase GitHub integration deletes the branch; the
+#            nightly reaper (OSP-infra 3.2) catches anything left over.
+# deploy false (the default) runs `plan` only: no Cloudflare or Supabase call and no secret. A caller turns it on
+# through a repository variable once its tokens exist, with no code change.
+#
+# Secrets, by name (the preview and cleanup jobs run in the caller's GitHub environment `environment`, default
+# `preview`, so environment secrets apply; repository secrets reach them through `secrets: inherit`):
+#   CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID   the project's preview token (cf-<project>-preview, IP-bound to the
+#                                                 coolify-ci egress) and the account id; needed whenever deploy is true
+#   SUPABASE_ACCESS_TOKEN                         Supabase Management API token (branch status, branch database
+#                                                 credentials); needed when supabase-project-ref is set
+#   CF_ACCESS_CLIENT_ID, CF_ACCESS_CLIENT_SECRET  optional Access service token for the probes and the verify command,
+#                                                 once previews sit behind Access (OSP-infra 3.3)
+# Each secret reaches only the steps that call that service. Install, build and the verify command never see the
+# Cloudflare or Supabase token. Tokens go to curl through header files, never through a command line.
+#
+# Caller. It grants contents: read and pull-requests: write, also for a dry run: GitHub checks the permissions of every
+# called job when the run starts. A full copy is tests/fixtures/cf-preview-caller.yml, which
+# tests/cf-preview-shared.test.sh checks against this file.
+#
+#   name: cf-preview
+#   on:
+#     pull_request:
+#       types: [opened, synchronize, reopened, ready_for_review, closed]
+#   permissions:
+#     contents: read
+#     pull-requests: write
+#   jobs:
+#     cf-preview:
+#       uses: DigitalSoftDistribution/.github/.github/workflows/cf-preview-shared.yml@main
+#       with:
+#         project: zephr
+#         deploy: ${{ vars.CF_PREVIEW_DEPLOY == 'true' }}
+#         supabase-project-ref: ${{ vars.SUPABASE_PREVIEW_BASE_REF }}
+#         build-command: pnpm --filter @zephr-ai/web build:edge && pnpm --filter @zephr-ai/worker-runtime build:cloudflare
+#         workers: >-
+#           [{"id": "web", "dir": "apps/web", "probe": "/api/ready", "mcp": "/api/cloud/mcp",
+#             "hyperdrive_binding": "HYPERDRIVE", "verify": "node scripts/hosted-verify.mjs \"$PREVIEW_URL\""},
+#            {"id": "runtime", "dir": "apps/worker/runtime", "hyperdrive_binding": "HYPERDRIVE"}]
+#       secrets: inherit
+#
+# No self-test workflow lives in this repository: it is public and the org runner groups do not serve public
+# repositories, so a coolify-ci job here queues until GitHub cancels it (the hallmark and gitleaks self-tests did, after
+# 24 h). The offline test is tests/cf-preview-shared.test.sh; the first CI proof is a private caller's dry run.
+name: cf-preview-shared
+
+on:
+  workflow_call:
+    inputs:
+      project:
+        description: "Name prefix of the project's Cloudflare resources (zephr, inboo): Hyperdrive <project>-pr-<N>, comment marker"
+        type: string
+        required: true
+      workers:
+        description: >
+          JSON array of 1 to 10 Workers to preview, each an object with: id (short name for the comment, [a-z0-9-]),
+          dir (the Worker's directory, relative), and optional config (wrangler config file name in dir; wrangler's own
+          lookup when absent), env (wrangler --env), probe (a path that must answer 2xx), mcp (path of a streamable
+          HTTP MCP endpoint: initialize + tools/list), hyperdrive_binding (binding name in `previews.hyperdrive` that an
+          own-branch PR points at <project>-pr-<N>; needs a .json or .jsonc config), verify (a shell command run at the
+          repository root with PREVIEW_URL set; it gets no Cloudflare or Supabase token).
+        type: string
+        required: true
+      deploy:
+        description: "false (default) = dry run: only the plan job runs, with no secret. true = make, probe and clean up previews."
+        type: boolean
+        default: false
+      runner:
+        description: "runs-on label; the self-hosted coolify-ci pool by default. GitHub-hosted runners are never used (design 5)."
+        type: string
+        default: "coolify-ci"
+      environment:
+        description: "GitHub environment of the preview and cleanup jobs, which holds the preview secrets"
+        type: string
+        default: "preview"
+      supabase-project-ref:
+        description: >
+          Ref of the NON-PROD Supabase project whose GitHub integration makes the PR branches (zephr: zephr-staging;
+          inboo: the inboo project, whose staging is a branch). "" = this workflow manages no database.
+        type: string
+        default: ""
+      shared-branch:
+        description: "Name of the persistent Supabase branch that PRs without a migration change share"
+        type: string
+        default: "preview"
+      migration-paths:
+        description: "Space-separated path prefixes; a PR that changes a file under one gets its own Supabase branch"
+        type: string
+        default: "supabase/"
+      branch-wait-minutes:
+        description: "How long to wait for the Supabase branch to finish its migrations and report healthy (1 to 30)"
+        type: number
+        default: 20
+      skip-drafts:
+        description: "A draft PR gets no preview until it is marked ready (the caller lists ready_for_review in its types)"
+        type: boolean
+        default: true
+      node-version:
+        type: string
+        default: "22"
+      pnpm-version:
+        description: "pnpm version for pnpm/action-setup; \"\" = no pnpm (an npm or yarn repository)"
+        type: string
+        default: "9"
+      install-command:
+        type: string
+        default: "pnpm install --frozen-lockfile"
+      build-command:
+        description: "Run at the repository root before the previews (for example the OpenNext build); \"\" = none"
+        type: string
+        default: ""
+      wrangler-version:
+        description: "Exact wrangler version, at least 4.135.0 (Worker Previews); installed outside the project"
+        type: string
+        default: "4.151.2"
+      cli-artifact:
+        description: "Name of the per-PR CLI artifact that another job of the caller run uploads; \"\" = no CLI line"
+        type: string
+        default: ""
+    secrets:
+      CLOUDFLARE_API_TOKEN:
+        required: false
+      CLOUDFLARE_ACCOUNT_ID:
+        required: false
+      SUPABASE_ACCESS_TOKEN:
+        required: false
+      CF_ACCESS_CLIENT_ID:
+        required: false
+      CF_ACCESS_CLIENT_SECRET:
+        required: false
+    outputs:
+      plan:
+        description: "The plan as JSON: project, pr, sha, action (preview, cleanup, skip), db (own, shared, none), deploy, workers"
+        value: ${{ jobs.plan.outputs.plan }}
+      manifest:
+        description: "The preview manifest as JSON (the same as in the sticky comment); empty on a dry run or a failure"
+        value: ${{ jobs.preview.outputs.manifest }}
+
+permissions:
+  contents: read
+
+jobs:
+  # No secret and no checkout: the inputs, the event and the PR's file list decide the run.
+  plan:
+    name: plan
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      action: ${{ steps.plan.outputs.action }}
+      db: ${{ steps.plan.outputs.db }}
+      workers: ${{ steps.plan.outputs.workers }}
+      plan: ${{ steps.plan.outputs.plan }}
+    steps:
+      - name: Plan
+        id: plan
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_ACTION: ${{ github.event.action }}
+          DRAFT: ${{ github.event.pull_request.draft }}
+          PROJECT: ${{ inputs.project }}
+          WORKERS: ${{ inputs.workers }}
+          DEPLOY: ${{ inputs.deploy }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          SUPABASE_REF: ${{ inputs.supabase-project-ref }}
+          SHARED_BRANCH: ${{ inputs.shared-branch }}
+          MIGRATION_PATHS: ${{ inputs.migration-paths }}
+          WAIT_MIN: ${{ inputs.branch-wait-minutes }}
+          SKIP_DRAFTS: ${{ inputs.skip-drafts }}
+          WRANGLER_VERSION: ${{ inputs.wrangler-version }}
+          CLI_ARTIFACT: ${{ inputs.cli-artifact }}
+        # Kept to bash 3.2 (tests/cf-preview-shared.test.py runs this step on macOS too): no empty arrays under set -u.
+        run: |
+          set -euo pipefail
+          set -f
+          fail() { echo "::error title=cf-preview-shared plan::$*"; exit 2; }
+
+          [[ "$PROJECT" =~ ^[a-z][a-z0-9-]{1,30}$ ]] || fail "project must match ^[a-z][a-z0-9-]{1,30}\$ (got '$PROJECT')"
+          [[ "$ENVIRONMENT" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || fail "environment must be a GitHub environment name (letters, digits, . _ -)"
+          [[ -z "$SUPABASE_REF" || "$SUPABASE_REF" =~ ^[a-z]{20}$ ]] || fail "supabase-project-ref must be empty or a 20-letter Supabase project ref"
+          [[ "$SHARED_BRANCH" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || fail "shared-branch must match ^[A-Za-z0-9._-]{1,64}\$"
+          [[ "$CLI_ARTIFACT" =~ ^[A-Za-z0-9._-]{0,100}$ ]] || fail "cli-artifact may hold only letters, digits and . _ -"
+          [[ "$WAIT_MIN" =~ ^[0-9]{1,2}$ ]] && [ "$WAIT_MIN" -ge 1 ] && [ "$WAIT_MIN" -le 30 ] || fail "branch-wait-minutes must be 1 to 30 (got '$WAIT_MIN')"
+          [[ "$PR" =~ ^[0-9]+$ ]] || fail "the event carries no pull request number"
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "the event carries no head commit"
+          [[ "$WRANGLER_VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || fail "wrangler-version must be an exact version x.y.z (got '$WRANGLER_VERSION')"
+          wmaj=$((10#${BASH_REMATCH[1]})); wmin=$((10#${BASH_REMATCH[2]}))
+          if [ "$wmaj" -lt 4 ] || { [ "$wmaj" -eq 4 ] && [ "$wmin" -lt 135 ]; }; then
+            fail "wrangler-version $WRANGLER_VERSION is older than 4.135.0, the first wrangler with Worker Previews"
+          fi
+
+          npaths=0
+          for p in $MIGRATION_PATHS; do
+            [[ "$p" =~ ^[A-Za-z0-9_][A-Za-z0-9._/-]*$ && "$p" != *..* ]] || fail "migration-paths: '$p' is not a plain relative path prefix"
+            npaths=$((npaths + 1))
+          done
+
+          # Every field is checked here, so the later jobs read only values this step passed.
+          jqerr=$(mktemp)
+          if ! workers=$(jq -c '
+            def str(re): type == "string" and test(re);
+            def opt(f; re): (f == null) or (f | str(re));
+            def path_ok: str("^[A-Za-z0-9_][A-Za-z0-9._/-]{0,200}$") and (contains("..") | not);
+            if type != "array" or length < 1 or length > 10 then error("must be a JSON array of 1 to 10 objects") else . end
+            | map(
+                if type != "object" then error("every Worker must be a JSON object") else . end
+                | ((keys - ["id", "dir", "config", "env", "probe", "mcp", "hyperdrive_binding", "verify"]) | join(", ")) as $extra
+                | if $extra != "" then error("unknown key(s): " + $extra) else . end
+                | if (.id | str("^[a-z0-9][a-z0-9-]{0,30}$")) | not then error("id must match ^[a-z0-9][a-z0-9-]{0,30}$") else . end
+                | .id as $id
+                | if (.dir == "." or (.dir | path_ok)) | not then error("\($id): dir must be . or a relative path without ..") else . end
+                | if opt(.config; "^[A-Za-z0-9_][A-Za-z0-9._-]{0,100}\\.(toml|json|jsonc)$") | not then error("\($id): config must be a wrangler .toml, .json or .jsonc file name in dir") else . end
+                | if opt(.env; "^[A-Za-z0-9_-]{1,50}$") | not then error("\($id): env must match ^[A-Za-z0-9_-]{1,50}$") else . end
+                | if opt(.probe; "^/[A-Za-z0-9._~/%?=&+-]{0,300}$") | not then error("\($id): probe must be a path starting with /") else . end
+                | if opt(.mcp; "^/[A-Za-z0-9._~/%?=&+-]{0,300}$") | not then error("\($id): mcp must be a path starting with /") else . end
+                | if opt(.hyperdrive_binding; "^[A-Z_][A-Z0-9_]{0,60}$") | not then error("\($id): hyperdrive_binding must be a binding name such as HYPERDRIVE") else . end
+                | if .verify == null or ((.verify | type) == "string" and (.verify | length) > 0 and (.verify | length) <= 1000) then . else error("\($id): verify must be a command of 1 to 1000 characters") end
+              )
+            | if (map(.id) | unique | length) != length then error("Worker ids must be unique") else . end
+          ' <<<"$WORKERS" 2>"$jqerr"); then
+            fail "workers: $(sed -e 's/^jq: error (at [^)]*): //' "$jqerr" | head -n 1)"
+          fi
+
+          action=preview; reason=""
+          if [ "$EVENT_ACTION" = closed ]; then
+            action=cleanup
+          elif [ "$DRAFT" = true ] && [ "$SKIP_DRAFTS" = true ]; then
+            action=skip; reason="draft pull request: the preview is made once it is marked ready"
+          fi
+
+          # Database: mirrors the Supabase GitHub integration, which branches a PR that changes its supabase directory.
+          db=none; hit=""
+          if [ "$action" = preview ] && [ -n "$SUPABASE_REF" ]; then
+            db=shared
+            if [ "$npaths" -gt 0 ]; then
+              files=$(gh api --paginate "repos/$REPO/pulls/$PR/files?per_page=100" --jq '.[].filename') \
+                || fail "could not list the files of PR $PR (the caller must grant pull-requests: read or write)"
+              while IFS= read -r f; do
+                [ -n "$f" ] || continue
+                for p in $MIGRATION_PATHS; do
+                  case "$f" in "$p"*) db=own; hit=$f; break 2 ;; esac
+                done
+              done <<<"$files"
+            fi
+          fi
+
+          plan=$(jq -cn --arg project "$PROJECT" --argjson pr "$PR" --arg sha "$HEAD_SHA" --arg action "$action" \
+            --arg db "$db" --arg reason "$reason" --argjson deploy "$DEPLOY" --argjson workers "$workers" \
+            '{v: 1, project: $project, pr: $pr, sha: $sha, action: $action, db: $db, reason: $reason, deploy: $deploy, workers: ($workers | map(.id))}')
+          {
+            echo "action=$action"
+            echo "db=$db"
+            echo "workers=$workers"
+            echo "plan=$plan"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "plan: $plan"
+          {
+            echo "### cf-preview-shared plan: $PROJECT pr-$PR"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| action | $action${reason:+ ($reason)} |"
+            echo "| database | $db${hit:+ (\`$hit\` is under a migration path)} |"
+            echo "| Workers | $(jq -r 'map(.id + " in " + .dir) | join(", ")' <<<"$workers") |"
+            echo "| commit | \`$HEAD_SHA\` |"
+            echo "| wrangler | $WRANGLER_VERSION |"
+            echo
+            if [ "$DEPLOY" = true ]; then
+              echo "deploy: true. The $action job runs in the environment \`$ENVIRONMENT\`."
+            else
+              echo "**Dry run** (deploy: false): the preview and cleanup jobs are skipped, no Cloudflare or Supabase call was made."
+              echo "A live run reads these secrets from the environment \`$ENVIRONMENT\`: CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID$([ -n "$SUPABASE_REF" ] && echo ", SUPABASE_ACCESS_TOKEN"), and optionally CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  preview:
+    name: preview
+    needs: plan
+    if: inputs.deploy && needs.plan.outputs.action == 'preview'
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 60
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      pull-requests: write
+    # One preview run per PR and project at a time; a newer push or the close supersedes it. The cf-preview-shared-
+    # prefix keeps this group apart from any group of the caller's own workflow.
+    concurrency:
+      group: cf-preview-shared-${{ github.repository }}-${{ inputs.project }}-pr-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    outputs:
+      manifest: ${{ steps.probes.outputs.manifest }}
+    env:
+      WRANGLER_SEND_METRICS: "false"
+    steps:
+      - name: Secrets present
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          DB: ${{ needs.plan.outputs.db }}
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+          missing=""
+          [ -n "$CLOUDFLARE_API_TOKEN" ] || missing="$missing CLOUDFLARE_API_TOKEN"
+          [ -n "$CLOUDFLARE_ACCOUNT_ID" ] || missing="$missing CLOUDFLARE_ACCOUNT_ID"
+          if [ "$DB" != none ] && [ -z "$SUPABASE_ACCESS_TOKEN" ]; then missing="$missing SUPABASE_ACCESS_TOKEN"; fi
+          if [ -n "$missing" ]; then
+            echo "::error title=cf-preview-shared::deploy is true but these secrets are empty:$missing. Set them in the environment '$ENVIRONMENT' of this repository, or keep deploy false."
+            exit 1
+          fi
+
+      # The PR head itself: the comment names the commit served, and reviewers compare it with the PR.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        if: inputs.pnpm-version != ''
+        with:
+          version: ${{ inputs.pnpm-version }}
+
+      # No actions/cache: every coolify-ci runner keeps a warm pnpm store and npm cache on local disk (ci-shared.yml).
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Install the project
+        if: inputs.install-command != ''
+        shell: bash
+        env:
+          CMD: ${{ inputs.install-command }}
+        run: bash -c "$CMD"
+
+      - name: Build the project
+        if: inputs.build-command != ''
+        shell: bash
+        env:
+          CMD: ${{ inputs.build-command }}
+        run: bash -c "$CMD"
+
+      # Pinned by the caller (design 5: one wrangler pin per repository, never a global one), outside the project tree.
+      - name: Install wrangler
+        shell: bash
+        env:
+          WRANGLER_VERSION: ${{ inputs.wrangler-version }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/cf-wrangler"
+          mkdir -p "$dir"
+          npm install --prefix "$dir" --no-save --no-audit --no-fund --loglevel=error "wrangler@${WRANGLER_VERSION}"
+          bin="$dir/node_modules/.bin/wrangler"
+          got=$("$bin" --version | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+          if [ "$got" != "$WRANGLER_VERSION" ]; then
+            echo "::error title=cf-preview-shared::wrangler reports '$got', wanted $WRANGLER_VERSION"
+            exit 1
+          fi
+          echo "CF_WRANGLER=$bin" >> "$GITHUB_ENV"
+
+      # Own branch: wait for the integration's branch, read its database credentials, upsert Hyperdrive <project>-pr-<N>.
+      # Shared branch: wait until it is healthy (the nightly reset may be running); its Hyperdrive config is long-lived.
+      # The branch `status` field is marked deprecated in the Management API but is still returned; it is the only field
+      # that tells MIGRATIONS_FAILED apart, and the branch detail adds the database health.
+      - name: Database
+        id: db
+        if: needs.plan.outputs.db != 'none'
+        shell: bash
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DB: ${{ needs.plan.outputs.db }}
+          PROJECT: ${{ inputs.project }}
+          SUPABASE_REF: ${{ inputs.supabase-project-ref }}
+          SHARED_BRANCH: ${{ inputs.shared-branch }}
+          WAIT_MIN: ${{ inputs.branch-wait-minutes }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error title=cf-preview-shared database::$*"; exit 1; }
+          umask 077
+          hdr=$(mktemp -d)
+          trap 'rm -rf "$hdr"' EXIT
+          printf 'Authorization: Bearer %s\n' "$SUPABASE_ACCESS_TOKEN" > "$hdr/sb"
+          printf 'Authorization: Bearer %s\nContent-Type: application/json\n' "$CLOUDFLARE_API_TOKEN" > "$hdr/cf"
+          sb() { curl -sS --fail-with-body --max-time 30 -H @"$hdr/sb" "https://api.supabase.com$1"; }
+          cf() { curl -sS --fail-with-body --max-time 60 -H @"$hdr/cf" "$@"; }
+          errs() { jq -c '.errors // .message // .' <<<"$1" 2>/dev/null | cut -c1-300; }
+
+          if [ "$DB" = own ]; then path="/v1/projects/$SUPABASE_REF/branches"; else path="/v1/projects/$SUPABASE_REF/branches/$SHARED_BRANCH"; fi
+          deadline=$(( $(date +%s) + WAIT_MIN * 60 ))
+          last="not created yet"; bname=""; detail=""
+          while :; do
+            if ! got=$(sb "$path"); then fail "Supabase API $path: $(errs "$got")"; fi
+            if [ "$DB" = own ]; then
+              branch=$(jq -c --argjson pr "$PR" --arg gb "$HEAD_REF" \
+                '[.[] | select(.pr_number == $pr or (.git_branch != null and .git_branch == $gb))] | first // empty' <<<"$got")
+            else
+              branch=$got
+            fi
+            if [ -n "$branch" ]; then
+              bid=$(jq -r '.id' <<<"$branch"); bname=$(jq -r '.name' <<<"$branch"); st=$(jq -r '.status // "UNKNOWN"' <<<"$branch")
+              case "$st" in
+                MIGRATIONS_FAILED|FUNCTIONS_FAILED)
+                  fail "Supabase branch $bname is $st: see the Supabase check on this pull request" ;;
+                MIGRATIONS_PASSED|FUNCTIONS_DEPLOYED)
+                  if ! detail=$(sb "/v1/branches/$bid"); then fail "Supabase API branch detail: $(errs "$detail")"; fi
+                  health=$(jq -r '.status // ""' <<<"$detail")
+                  [ "$health" = ACTIVE_HEALTHY ] && break
+                  last="$st, database $health" ;;
+                *) last=$st ;;
+              esac
+            fi
+            [ "$(date +%s)" -lt "$deadline" ] || fail "no healthy Supabase branch for pr-$PR after $WAIT_MIN min (last state: $last)"
+            sleep 20
+          done
+          echo "Supabase branch $bname is ready"
+
+          if [ "$DB" = own ]; then
+            DB_HOST=$(jq -r '.db_host // empty' <<<"$detail")
+            DB_PORT=$(jq -r '.db_port // 5432' <<<"$detail")
+            DB_USER=$(jq -r '.db_user // "postgres"' <<<"$detail")
+            DB_PASS=$(jq -r '.db_pass // empty' <<<"$detail")
+            [ -n "$DB_HOST" ] && [ -n "$DB_PASS" ] || fail "the Supabase token cannot read the database host and password of branch $bname"
+            echo "::add-mask::$DB_PASS"
+            export DB_HOST DB_PORT DB_USER DB_PASS
+            name="$PROJECT-pr-$PR"
+            base="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/hyperdrive/configs"
+            if ! configs=$(cf "$base"); then fail "Cloudflare API Hyperdrive list: $(errs "$configs")"; fi
+            hid=$(jq -r --arg n "$name" '[.result[]? | select(.name == $n) | .id] | first // empty' <<<"$configs")
+            # The password reaches jq through its environment and curl through stdin, never a command line.
+            body=$(HD_NAME="$name" jq -cn '{name: env.HD_NAME, origin: {scheme: "postgres", host: env.DB_HOST, port: (env.DB_PORT | tonumber), database: "postgres", user: env.DB_USER, password: env.DB_PASS}}')
+            if [ -n "$hid" ]; then
+              if ! resp=$(printf '%s' "$body" | cf -X PUT --data-binary @- "$base/$hid"); then fail "Cloudflare API Hyperdrive update of $name: $(errs "$resp")"; fi
+            else
+              if ! resp=$(printf '%s' "$body" | cf -X POST --data-binary @- "$base"); then fail "Cloudflare API Hyperdrive create of $name: $(errs "$resp")"; fi
+              hid=$(jq -r '.result.id // empty' <<<"$resp")
+            fi
+            [[ "$hid" =~ ^[0-9a-f]{32}$ ]] || fail "Cloudflare API returned no Hyperdrive id for $name"
+            echo "hyperdrive_id=$hid" >> "$GITHUB_OUTPUT"
+            echo "label=own Supabase branch \`$bname\`, Hyperdrive \`$name\`" >> "$GITHUB_OUTPUT"
+          else
+            echo "label=shared Supabase branch \`$bname\`, Hyperdrive \`$PROJECT-preview\` (bound in each previews block)" >> "$GITHUB_OUTPUT"
+          fi
+
+      # One `wrangler preview --name pr-<N>` per Worker. For an own branch, a Worker with hyperdrive_binding is previewed
+      # from a copy of its config (same directory, so relative paths hold) whose previews.hyperdrive points that binding
+      # at <project>-pr-<N>. Kept to bash 3.2 (the offline test runs this step on macOS with a stub wrangler).
+      - name: Worker Previews
+        id: workers
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          WORKERS: ${{ needs.plan.outputs.workers }}
+          DB: ${{ needs.plan.outputs.db }}
+          HYPERDRIVE_ID: ${{ steps.db.outputs.hyperdrive_id }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error title=cf-preview-shared preview::$*"; exit 1; }
+          results="$RUNNER_TEMP/cf-preview-workers.jsonl"
+          : > "$results"
+          while IFS= read -r w; do
+            id=$(jq -r '.id' <<<"$w"); dir=$(jq -r '.dir' <<<"$w"); config=$(jq -r '.config // ""' <<<"$w")
+            wenv=$(jq -r '.env // ""' <<<"$w"); hb=$(jq -r '.hyperdrive_binding // ""' <<<"$w")
+            [ -d "$dir" ] || fail "Worker $id: directory $dir does not exist at $HEAD_SHA"
+            set -- preview --name "pr-$PR" --json --message "PR #$PR at ${HEAD_SHA:0:12}"
+            [ -z "$wenv" ] || set -- "$@" --env "$wenv"
+            if [ "$DB" = own ] && [ -n "$hb" ]; then
+              src=$config
+              if [ -z "$src" ]; then
+                for c in wrangler.jsonc wrangler.json wrangler.toml; do
+                  if [ -f "$dir/$c" ]; then src=$c; break; fi
+                done
+              fi
+              [ -n "$src" ] && [ -f "$dir/$src" ] || fail "Worker $id: no wrangler config in $dir"
+              copy=".cf-preview-pr-$PR.json"
+              python3 -I - "$dir/$src" "$dir/$copy" "$hb" "$HYPERDRIVE_ID" "$wenv" <<'PY'
+          import json, re, sys
+          src, out, binding, hid, env_name = sys.argv[1:6]
+          def die(msg):
+              print(f"::error title=cf-preview-shared config::{src}: {msg}")
+              sys.exit(1)
+          if not re.search(r"\.jsonc?$", src):
+              die("an own-branch preview rewrites previews.hyperdrive, which needs a .json or .jsonc wrangler config")
+          if not re.fullmatch(r"[0-9a-f]{32}", hid):
+              die("no Hyperdrive id from the Database step")
+          def strings_kept(text, on_char):
+              out, i, n = [], 0, len(text)
+              while i < n:
+                  if text[i] == '"':
+                      j = i + 1
+                      while j < n and text[j] != '"':
+                          j += 2 if text[j] == "\\" else 1
+                      out.append(text[i:j + 1])
+                      i = j + 1
+                      continue
+                  i = on_char(text, i, out)
+              return "".join(out)
+          def comments(text, i, out):
+              if text.startswith("//", i):
+                  j = text.find("\n", i)
+                  return len(text) if j < 0 else j
+              if text.startswith("/*", i):
+                  j = text.find("*/", i + 2)
+                  if j < 0:
+                      die("unclosed block comment")
+                  out.append(" ")
+                  return j + 2
+              out.append(text[i])
+              return i + 1
+          def trailing_commas(text, i, out):
+              if text[i] == ",":
+                  j = i + 1
+                  while j < len(text) and text[j] in " \t\r\n":
+                      j += 1
+                  if j < len(text) and text[j] in "}]":
+                      return i + 1
+              out.append(text[i])
+              return i + 1
+          raw = open(src, encoding="utf-8").read()
+          try:
+              cfg = json.loads(strings_kept(strings_kept(raw, comments), trailing_commas))
+          except ValueError as e:
+              die(f"not valid JSON or JSONC ({e})")
+          target = (cfg.get("env") or {}).get(env_name) if env_name else cfg
+          if not isinstance(target, dict):
+              die(f"no env {env_name!r}")
+          previews = target.get("previews")
+          if not isinstance(previews, dict):
+              die("no previews block" + (f" in env {env_name}" if env_name else "") + "; Worker Previews need one")
+          entries = previews.get("hyperdrive") if isinstance(previews.get("hyperdrive"), list) else []
+          hit = next((h for h in entries if isinstance(h, dict) and h.get("binding") == binding), None)
+          if hit is None:
+              entries.append({"binding": binding, "id": hid})
+          else:
+              hit["id"] = hid
+          previews["hyperdrive"] = entries
+          with open(out, "w", encoding="utf-8") as f:
+              json.dump(cfg, f, indent=2)
+              f.write("\n")
+          print(f"{src}: previews.hyperdrive {binding} -> {hid}, previewed from {out}")
+          PY
+              set -- "$@" --config "$copy"
+            elif [ -n "$config" ]; then
+              set -- "$@" --config "$config"
+            fi
+            echo "::group::wrangler $* ($id in $dir)"
+            # stdin from /dev/null: the loop reads the Worker list from stdin.
+            if ! out=$(cd "$dir" && "$CF_WRANGLER" "$@" < /dev/null); then
+              echo "::endgroup::"
+              fail "Worker $id: wrangler preview failed (log above)"
+            fi
+            echo "::endgroup::"
+            url=$(jq -er '.preview.urls[0]' <<<"$out" 2>/dev/null) || fail "Worker $id: wrangler printed no .preview.urls[0]"
+            url=${url%/}
+            [[ "$url" =~ ^https://[A-Za-z0-9.-]+$ ]] || fail "Worker $id: unexpected preview URL '$url'"
+            jq -c --arg url "$url" '. + {url: $url}' <<<"$w" >> "$results"
+            echo "$id: $url"
+          done < <(jq -c '.[]' <<<"$WORKERS")
+
+      # Every probe is recorded; the comment shows them all and the Verdict step fails the job afterwards.
+      - name: Probes
+        id: probes
+        shell: bash
+        env:
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          PROJECT: ${{ inputs.project }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          DB: ${{ needs.plan.outputs.db }}
+        run: |
+          set -uo pipefail
+          umask 077
+          tmp=$(mktemp -d)
+          trap 'rm -rf "$tmp"' EXIT
+          : > "$tmp/access"
+          if [ -n "$CF_ACCESS_CLIENT_ID" ] && [ -n "$CF_ACCESS_CLIENT_SECRET" ]; then
+            printf 'CF-Access-Client-Id: %s\nCF-Access-Client-Secret: %s\n' "$CF_ACCESS_CLIENT_ID" "$CF_ACCESS_CLIENT_SECRET" > "$tmp/access"
+          fi
+          rpc() { if grep -q '^data:' "$1"; then sed -n 's/^data: *//p' "$1" | tail -n 1; else cat "$1"; fi; }
+          get_probe() {
+            local code=000 n
+            for n in 1 2 3 4 5 6 7 8 9 10; do
+              code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 -H @"$tmp/access" "$1" 2>/dev/null) || code=000
+              case "$code" in 2??) echo "pass ($code)"; return 0 ;; esac
+              sleep 6
+            done
+            echo "FAIL ($code)"; return 1
+          }
+          mcp_probe() {
+            local u=$1 sid
+            local init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"cf-preview-shared","version":"1.0.0"}}}'
+            set -- -sS --max-time 30 -H @"$tmp/access" -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream'
+            curl "$@" -D "$tmp/h1" -o "$tmp/b1" --data "$init" "$u" 2>/dev/null || { echo "FAIL (initialize: no answer)"; return 1; }
+            rpc "$tmp/b1" | jq -e '.result.protocolVersion' >/dev/null 2>&1 || { echo "FAIL (initialize: no result)"; return 1; }
+            sid=$(tr -d '\r' < "$tmp/h1" | awk -F': *' 'tolower($1) == "mcp-session-id" { print $2; exit }')
+            set -- "$@" -H 'MCP-Protocol-Version: 2025-06-18'
+            [ -z "$sid" ] || set -- "$@" -H "Mcp-Session-Id: $sid"
+            curl "$@" -o /dev/null --data '{"jsonrpc":"2.0","method":"notifications/initialized"}' "$u" 2>/dev/null || true
+            curl "$@" -o "$tmp/b2" --data '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' "$u" 2>/dev/null || { echo "FAIL (tools/list: no answer)"; return 1; }
+            local n
+            n=$(rpc "$tmp/b2" | jq -e '.result.tools | length' 2>/dev/null) || { echo "FAIL (tools/list: no tools array)"; return 1; }
+            echo "pass ($n tools)"
+          }
+          failed=0
+          : > "$RUNNER_TEMP/cf-preview-probed.jsonl"
+          while IFS= read -r w; do
+            id=$(jq -r '.id' <<<"$w"); url=$(jq -r '.url' <<<"$w")
+            probe=$(jq -r '.probe // ""' <<<"$w"); mcp=$(jq -r '.mcp // ""' <<<"$w"); verify=$(jq -r '.verify // ""' <<<"$w")
+            pr_res="-"; mcp_res="-"; ver_res="-"
+            if [ -n "$probe" ]; then pr_res="$probe $(get_probe "$url$probe")" || failed=$((failed + 1)); fi
+            if [ -n "$mcp" ]; then mcp_res=$(mcp_probe "$url$mcp") || failed=$((failed + 1)); fi
+            if [ -n "$verify" ]; then
+              echo "::group::verify $id"
+              if PREVIEW_URL="$url" bash -c "$verify" < /dev/null; then ver_res=pass; else ver_res="FAIL (exit $?)"; failed=$((failed + 1)); fi
+              echo "::endgroup::"
+            fi
+            echo "$id: probe $pr_res; mcp $mcp_res; verify $ver_res"
+            jq -c --arg p "$pr_res" --arg m "$mcp_res" --arg v "$ver_res" '. + {probe_result: $p, mcp_result: $m, verify_result: $v}' <<<"$w" \
+              >> "$RUNNER_TEMP/cf-preview-probed.jsonl"
+          done < "$RUNNER_TEMP/cf-preview-workers.jsonl"
+          manifest=$(jq -cs --arg project "$PROJECT" --arg repo "$REPO" --argjson pr "$PR" --arg sha "$HEAD_SHA" --arg db "$DB" \
+            '{v: 1, project: $project, repo: $repo, pr: $pr, preview: ("pr-" + ($pr | tostring)), sha: $sha, db: $db,
+              workers: map({id, url, mcp: (if .mcp then .url + .mcp else null end), probe: .probe_result, mcp_probe: .mcp_result, verify: .verify_result})}' \
+            "$RUNNER_TEMP/cf-preview-probed.jsonl")
+          echo "manifest=$manifest" >> "$GITHUB_OUTPUT"
+          echo "failed=$failed" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Cloudflare preview pr-$PR ($PROJECT)"
+            echo
+            echo "| Worker | URL | Probe | MCP | Verify |"
+            echo "|---|---|---|---|---|"
+            jq -r '"| \(.id) | \(.url) | \(.probe_result) | \(.mcp_result) | \(.verify_result) |"' "$RUNNER_TEMP/cf-preview-probed.jsonl"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ONE comment per PR and project, edited in place (only comments of github-actions[bot] are matched).
+      - name: Sticky comment
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PROJECT: ${{ inputs.project }}
+          CLI_ARTIFACT: ${{ inputs.cli-artifact }}
+          DB_LABEL: ${{ steps.db.outputs.label || 'not managed by this workflow (no supabase-project-ref)' }}
+          MANIFEST: ${{ steps.probes.outputs.manifest }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          marker="<!-- cf-preview-shared:$PROJECT -->"
+          body="$RUNNER_TEMP/cf-preview-comment.md"
+          if [ -n "$MANIFEST" ] && [ -s "$RUNNER_TEMP/cf-preview-probed.jsonl" ]; then
+            {
+              echo "$marker"
+              echo "### Cloudflare preview \`pr-$PR\` ($PROJECT)"
+              echo
+              echo "| Worker | URL | Probe | MCP | Verify |"
+              echo "|---|---|---|---|---|"
+              jq -r '"| \(.id) | \(.url) | \(.probe_result) | \(.mcp_result) | \(.verify_result) |"' "$RUNNER_TEMP/cf-preview-probed.jsonl"
+              echo
+              echo "- Database: $DB_LABEL"
+              echo "- Commit served: \`$HEAD_SHA\`"
+              if [ -n "$CLI_ARTIFACT" ]; then echo "- CLI: artifact \`$CLI_ARTIFACT\` of [this run]($RUN_URL)"; fi
+              echo "- Attach in DSH: \`preview_mcp_attach(repo=\"$REPO\", pr=$PR)\`"
+              echo "- Run: $RUN_URL"
+              echo
+              echo "<!-- cf-preview-manifest $MANIFEST -->"
+            } > "$body"
+          else
+            {
+              echo "$marker"
+              echo "### Cloudflare preview \`pr-$PR\` ($PROJECT): not made"
+              echo
+              echo "The preview job stopped before every Worker had a URL, at commit \`$HEAD_SHA\`. Log: $RUN_URL"
+            } > "$body"
+          fi
+          cid=$(gh api --paginate "repos/$REPO/issues/$PR/comments?per_page=100" \
+            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$marker\"))) | .id" | tail -n 1)
+          if [ -n "$cid" ]; then
+            jq -n --rawfile b "$body" '{body: $b}' | gh api --method PATCH "repos/$REPO/issues/comments/$cid" --input - >/dev/null
+          else
+            jq -n --rawfile b "$body" '{body: $b}' | gh api --method POST "repos/$REPO/issues/$PR/comments" --input - >/dev/null
+          fi
+          echo "comment updated on PR $PR"
+
+      - name: Verdict
+        if: steps.probes.outcome == 'success'
+        shell: bash
+        env:
+          FAILED: ${{ steps.probes.outputs.failed }}
+        run: |
+          if [ "$FAILED" != 0 ]; then
+            echo "::error title=cf-preview-shared::$FAILED probe(s) failed; the PR comment lists them"
+            exit 1
+          fi
+          echo "all probes passed"
+
+  # Best effort per resource: what is not removed is reported as a warning and in the comment; the nightly reaper
+  # (OSP-infra 3.2) retries. No project install: `wrangler preview delete` reads only the config.
+  cleanup:
+    name: cleanup
+    needs: plan
+    if: inputs.deploy && needs.plan.outputs.action == 'cleanup'
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 15
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      pull-requests: write
+    concurrency:
+      group: cf-preview-shared-${{ github.repository }}-${{ inputs.project }}-pr-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    env:
+      WRANGLER_SEND_METRICS: "false"
+    steps:
+      - name: Secrets present
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "::error title=cf-preview-shared::deploy is true but CLOUDFLARE_API_TOKEN or CLOUDFLARE_ACCOUNT_ID is empty in the environment '$ENVIRONMENT'"
+            exit 1
+          fi
+
+      # The configs as the preview used them (the head commit stays fetchable after the branch is deleted).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Install wrangler
+        shell: bash
+        env:
+          WRANGLER_VERSION: ${{ inputs.wrangler-version }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/cf-wrangler"
+          mkdir -p "$dir"
+          npm install --prefix "$dir" --no-save --no-audit --no-fund --loglevel=error "wrangler@${WRANGLER_VERSION}"
+          echo "CF_WRANGLER=$dir/node_modules/.bin/wrangler" >> "$GITHUB_ENV"
+
+      - name: Remove previews and the PR Hyperdrive config
+        id: remove
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          WORKERS: ${{ needs.plan.outputs.workers }}
+          PROJECT: ${{ inputs.project }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -uo pipefail
+          left=""
+          while IFS= read -r w; do
+            id=$(jq -r '.id' <<<"$w"); dir=$(jq -r '.dir' <<<"$w"); config=$(jq -r '.config // ""' <<<"$w"); wenv=$(jq -r '.env // ""' <<<"$w")
+            set -- preview delete --name "pr-$PR" --skip-confirmation
+            [ -z "$wenv" ] || set -- "$@" --env "$wenv"
+            [ -z "$config" ] || set -- "$@" --config "$config"
+            if [ -d "$dir" ] && (cd "$dir" && "$CF_WRANGLER" "$@" < /dev/null); then
+              echo "$id: pr-$PR removed"
+            else
+              echo "::warning title=cf-preview-shared cleanup::Worker $id: pr-$PR not removed (already gone, or the error above); the nightly reaper retries"
+              left="$left $id"
+            fi
+          done < <(jq -c '.[]' <<<"$WORKERS")
+
+          umask 077
+          hdr=$(mktemp -d)
+          trap 'rm -rf "$hdr"' EXIT
+          printf 'Authorization: Bearer %s\n' "$CLOUDFLARE_API_TOKEN" > "$hdr/cf"
+          name="$PROJECT-pr-$PR"
+          base="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/hyperdrive/configs"
+          if configs=$(curl -sS --fail-with-body --max-time 60 -H @"$hdr/cf" "$base"); then
+            hid=$(jq -r --arg n "$name" '[.result[]? | select(.name == $n) | .id] | first // empty' <<<"$configs")
+            if [ -z "$hid" ]; then
+              echo "Hyperdrive $name: none (shared database, or already gone)"
+            elif curl -sS --fail-with-body --max-time 60 -H @"$hdr/cf" -X DELETE "$base/$hid" >/dev/null; then
+              echo "Hyperdrive $name removed"
+            else
+              echo "::warning title=cf-preview-shared cleanup::Hyperdrive $name not removed; the nightly reaper retries"
+              left="$left hyperdrive:$name"
+            fi
+          else
+            echo "::warning title=cf-preview-shared cleanup::Hyperdrive list failed; $name, if it exists, is left for the nightly reaper"
+            left="$left hyperdrive:$name"
+          fi
+          echo "left=${left# }" >> "$GITHUB_OUTPUT"
+
+      - name: Mark the comment removed
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PROJECT: ${{ inputs.project }}
+          LEFT: ${{ steps.remove.outputs.left }}
+          REMOVE_OUTCOME: ${{ steps.remove.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          marker="<!-- cf-preview-shared:$PROJECT -->"
+          cid=$(gh api --paginate "repos/$REPO/issues/$PR/comments?per_page=100" \
+            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$marker\"))) | .id" | tail -n 1)
+          if [ -z "$cid" ]; then
+            echo "no preview comment on PR $PR: nothing to mark"
+            exit 0
+          fi
+          body="$RUNNER_TEMP/cf-preview-comment.md"
+          {
+            echo "$marker"
+            echo "### Cloudflare preview \`pr-$PR\` ($PROJECT): removed (PR closed)"
+            echo
+            if [ "$REMOVE_OUTCOME" != success ]; then
+              echo "The cleanup did not finish; the nightly reaper removes what is left. Log: $RUN_URL"
+            elif [ -n "$LEFT" ]; then
+              echo "Not removed, left for the nightly reaper: \`$LEFT\`. Log: $RUN_URL"
+            else
+              echo "Every Worker Preview and the PR's Hyperdrive config are gone. Log: $RUN_URL"
+            fi
+            echo
+            echo "<!-- cf-preview-manifest $(jq -cn --arg project "$PROJECT" --arg repo "$REPO" --argjson pr "$PR" --arg sha "$HEAD_SHA" \
+              '{v: 1, project: $project, repo: $repo, pr: $pr, preview: ("pr-" + ($pr | tostring)), sha: $sha, removed: true}') -->"
+          } > "$body"
+          jq -n --rawfile b "$body" '{body: $b}' | gh api --method PATCH "repos/$REPO/issues/comments/$cid" --input - >/dev/null
+          echo "comment marked removed on PR $PR"

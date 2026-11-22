@@ -1,0 +1,30 @@
+# Test caller of .github/workflows/cf-preview-shared.yml, in the shape a private repo copies to
+# .github/workflows/cf-preview.yml (here: zephr's two Workers). tests/cf-preview-shared.test.sh checks it against the
+# reusable workflow. It is a fixture, not a workflow of this repo: this repo is public and the org runner groups do not
+# serve public repositories.
+#
+# deploy stays false (a dry run: only the plan job, no secret) until the repository variable CF_PREVIEW_DEPLOY is
+# 'true', which the owner sets once the preview tokens are in the environment `preview`.
+name: cf-preview
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, closed]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  cf-preview:
+    uses: DigitalSoftDistribution/.github/.github/workflows/cf-preview-shared.yml@main
+    with:
+      project: zephr
+      deploy: ${{ vars.CF_PREVIEW_DEPLOY == 'true' }}
+      supabase-project-ref: ${{ vars.SUPABASE_PREVIEW_BASE_REF }}
+      build-command: pnpm --filter @zephr-ai/web build:edge && pnpm --filter @zephr-ai/worker-runtime build:cloudflare
+      workers: >-
+        [{"id": "web", "dir": "apps/web", "probe": "/api/ready", "mcp": "/api/cloud/mcp",
+          "hyperdrive_binding": "HYPERDRIVE", "verify": "node scripts/hosted-verify.mjs \"$PREVIEW_URL\""},
+         {"id": "runtime", "dir": "apps/worker/runtime", "hyperdrive_binding": "HYPERDRIVE"}]
+    secrets: inherit
